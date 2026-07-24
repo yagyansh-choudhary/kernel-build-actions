@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next
+name: Build Zenith 6.9 Kernel with KernelSU Next v3
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - ".github/workflows/build-zenith-kernel.yml"
+      - ".github/workflows/build-zenith-kernel-v3.yml"
       - "kernel-configs/zenith-6.9-x86_64.config"
 
 permissions:
@@ -24,6 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
+      WORKFLOW_REVISION: "2026-07-24-v3-kconfig-grep-fix"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
@@ -36,6 +37,13 @@ jobs:
       MODULES_DIR: ${{ github.workspace }}/modules-staging
 
     steps:
+      - name: Confirm workflow revision
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Running workflow revision: $WORKFLOW_REVISION"
+          echo "Expected fixed verification: source \"drivers/kernelsu/Kconfig\""
+
       - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
@@ -240,10 +248,15 @@ jobs:
               ksu_kconfig.write_text(text)
           PY
 
+          echo "=== KernelSU integration verification ==="
+          ls -l drivers/kernelsu
+          grep -Fn 'kernelsu' drivers/Makefile || true
+          grep -Fn 'drivers/kernelsu/Kconfig' drivers/Kconfig || true
+
           test -L drivers/kernelsu
           test "$(readlink drivers/kernelsu)" = "../KernelSU-Next/kernel"
           test "$(grep -Fxc 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile)" -eq 1
-          test "$(grep -Fxc 'source \"drivers/kernelsu/Kconfig\"' drivers/Kconfig)" -eq 1
+          grep -Fxq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           grep -q '^config KSU_X86_PATCH_SYSCALL_DISPATCHER$' KernelSU-Next/kernel/Kconfig
 
       - name: Apply original config and resolve new options
