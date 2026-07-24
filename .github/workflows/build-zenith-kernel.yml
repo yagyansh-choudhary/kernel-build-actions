@@ -1,0 +1,434 @@
+name: Build Zenith 6.9 Kernel with KernelSU Next
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-zenith-kernel.yml"
+      - "kernel-configs/zenith-6.9-x86_64.config"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zenith-6.9-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile x86_64 bzImage and modules
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
+      KERNEL_BRANCH: "6.9"
+      KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
+      KSU_BRANCH: dev
+      KERNEL_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith
+      OUT_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith/out
+      CONFIG_FILE: ${{ github.workspace }}/kernel-configs/zenith-6.9-x86_64.config
+      ARTIFACT_DIR: ${{ github.workspace }}/build-artifacts
+      LOG_DIR: ${{ github.workspace }}/build-logs
+      MODULES_DIR: ${{ github.workspace }}/modules-staging
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Show runner resources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cat /etc/os-release
+          echo "CPU cores: $(nproc)"
+          free -h
+          df -h /
+
+      - name: Update and upgrade Ubuntu
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get upgrade -y
+
+      - name: Install kernel, Android, Bazel, Python and Rust prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates gnupg curl wget git git-lfs \
+            flex bison build-essential gcc g++ gcc-multilib g++-multilib \
+            make bc binutils binutils-dev clang llvm lld libclang-dev \
+            libssl-dev libelf-dev libdw-dev dwarves sparse \
+            libncurses-dev pkg-config perl rsync cpio kmod fakeroot \
+            zip unzip tar gzip bzip2 xz-utils lz4 zstd \
+            zlib1g-dev liblz4-dev libzstd-dev liblzma-dev \
+            libc6-dev-i386 lib32z1-dev x11proto-dev libx11-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc fontconfig \
+            python3 python3-dev python3-pip python3-setuptools \
+            python3-wheel python3-venv python3-pyelftools python3-yaml \
+            python3-jinja2 python-is-python3 \
+            device-tree-compiler u-boot-tools ccache ninja-build cmake \
+            autoconf automake libtool gettext gawk file patch diffutils jq \
+            openssl openjdk-17-jdk-headless libcap-dev libudev-dev libpci-dev
+
+          # Android repo launcher.
+          sudo curl --fail --location --retry 5 \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output /usr/local/bin/repo
+          sudo chmod 0755 /usr/local/bin/repo
+
+          # Bazel through Bazelisk.
+          sudo curl --fail --location --retry 5 \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+            --output /usr/local/bin/bazelisk
+          sudo chmod 0755 /usr/local/bin/bazelisk
+          sudo ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel
+
+          # Rust toolchain and bindgen, needed by Rust-enabled kernel trees.
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+            https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          source "$HOME/.cargo/env"
+          rustup component add rust-src rustfmt clippy
+          cargo install --locked bindgen-cli
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          git lfs install --skip-repo
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Verify supplied kernel config
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -s "$CONFIG_FILE"
+          grep -qx 'CONFIG_X86_64=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_MODULES=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_KSU=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_KPROBES=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_EXT4_FS=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_OVERLAY_FS=y' "$CONFIG_FILE"
+          sha256sum "$CONFIG_FILE"
+
+      - name: Clone only Zenith branch 6.9
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$KERNEL_DIR"
+          mkdir -p "$(dirname "$KERNEL_DIR")"
+          git clone \
+            --branch "$KERNEL_BRANCH" \
+            --single-branch \
+            --depth 1 \
+            "$KERNEL_REPO" \
+            "$KERNEL_DIR"
+          test "$(git -C "$KERNEL_DIR" branch --show-current)" = "$KERNEL_BRANCH"
+          git -C "$KERNEL_DIR" log -1 --oneline
+
+      - name: Remove old KernelSU tree and integration
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          git submodule deinit -f -- KernelSU 2>/dev/null || true
+          rm -rf KernelSU .git/modules/KernelSU
+          rm -f drivers/kernelsu
+
+          if [ -f .gitmodules ]; then
+            git config -f .gitmodules --remove-section submodule.KernelSU 2>/dev/null || true
+            if ! grep -q '^\[submodule ' .gitmodules; then
+              rm -f .gitmodules
+            fi
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          makefile = Path("drivers/Makefile")
+          make_entry = "obj-$(CONFIG_KSU) += kernelsu/"
+          lines = [line for line in makefile.read_text().splitlines() if line.strip() != make_entry]
+          makefile.write_text("\n".join(lines).rstrip() + "\n")
+
+          kconfig = Path("drivers/Kconfig")
+          kconfig_entry = 'source "drivers/kernelsu/Kconfig"'
+          lines = [line for line in kconfig.read_text().splitlines() if line.strip() != kconfig_entry]
+          kconfig.write_text("\n".join(lines).rstrip() + "\n")
+          PY
+
+          test ! -e KernelSU
+          test ! -e drivers/kernelsu
+
+      - name: Clone latest KernelSU Next dev tree
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          rm -rf KernelSU-Next
+
+          # Full clone avoids KernelSU's build logic trying to unshallow the repo later.
+          git clone --branch "$KSU_BRANCH" --single-branch "$KSU_REPO" KernelSU-Next
+
+          test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Kbuild
+          test -f KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
+
+          # Linux 6.9 hardened x86_64 syscall dispatch. Refuse to build unless
+          # the KernelSU Next runtime dispatcher patch implementation is present.
+          grep -q 'CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER' \
+            KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
+          grep -q 'patch_abs_jump("x64_sys_call"' \
+            KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
+
+          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
+          git -C KernelSU-Next log -1 --oneline
+
+      - name: Integrate KernelSU Next and ensure x86_64 fix option exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          ln -s ../KernelSU-Next/kernel drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          drivers_kconfig = Path("drivers/Kconfig")
+          source_entry = 'source "drivers/kernelsu/Kconfig"'
+          lines = drivers_kconfig.read_text().splitlines()
+          if source_entry not in [line.strip() for line in lines]:
+              for i in range(len(lines) - 1, -1, -1):
+                  if lines[i].strip() == "endmenu":
+                      lines.insert(i, source_entry)
+                      break
+              else:
+                  raise SystemExit("drivers/Kconfig has no endmenu")
+              drivers_kconfig.write_text("\n".join(lines).rstrip() + "\n")
+
+          # Some moving dev snapshots have contained the x86_64 implementation
+          # before exposing its Kconfig symbol. Add the official symbol locally
+          # when absent, so the implementation can actually be enabled.
+          ksu_kconfig = Path("KernelSU-Next/kernel/Kconfig")
+          text = ksu_kconfig.read_text()
+          symbol = "config KSU_X86_PATCH_SYSCALL_DISPATCHER"
+          if symbol not in text:
+              stanza = "\n".join([
+                  "",
+                  "config KSU_X86_PATCH_SYSCALL_DISPATCHER",
+                  "\tbool \"Dynamically patch x64 hardened syscall dispatcher\"",
+                  "\tdepends on KSU && X86_64",
+                  "\tdefault n",
+                  "\thelp",
+                  "\t  Enable KernelSU Next runtime patching for the hardened x86_64",
+                  "\t  syscall dispatcher used by Linux 6.9 and related backports.",
+                  "",
+              ])
+              pos = text.rfind("endmenu")
+              if pos < 0:
+                  raise SystemExit("KernelSU Next Kconfig has no endmenu")
+              text = text[:pos] + stanza + "\n" + text[pos:]
+              ksu_kconfig.write_text(text)
+          PY
+
+          test -L drivers/kernelsu
+          test "$(readlink drivers/kernelsu)" = "../KernelSU-Next/kernel"
+          test "$(grep -Fxc 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile)" -eq 1
+          test "$(grep -Fxc 'source \"drivers/kernelsu/Kconfig\"' drivers/Kconfig)" -eq 1
+          grep -q '^config KSU_X86_PATCH_SYSCALL_DISPATCHER$' KernelSU-Next/kernel/Kconfig
+
+      - name: Apply original config and resolve new options
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+          cp "$CONFIG_FILE" "$OUT_DIR/.config"
+
+          ./scripts/config --file "$OUT_DIR/.config" \
+            --enable X86_64 \
+            --enable MODULES \
+            --enable KPROBES \
+            --enable KPROBES_ON_FTRACE \
+            --enable KPROBE_EVENTS \
+            --enable EXT4_FS \
+            --enable OVERLAY_FS \
+            --enable KSU \
+            --enable KSU_X86_PATCH_SYSCALL_DISPATCHER
+
+          make O="$OUT_DIR" ARCH=x86_64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+          for option in X86_64 MODULES KPROBES EXT4_FS OVERLAY_FS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER; do
+            grep -qx "CONFIG_${option}=y" "$OUT_DIR/.config" || {
+              echo "CONFIG_${option}=y is missing after olddefconfig" >&2
+              exit 1
+            }
+          done
+
+          echo "=== Final key config options ==="
+          grep -E '^CONFIG_(X86_64|MODULES|KSU|KSU_X86_PATCH_SYSCALL_DISPATCHER|KPROBES|KPROBES_ON_FTRACE|KPROBE_EVENTS|EXT4_FS|OVERLAY_FS|LTO_CLANG_FULL)=' "$OUT_DIR/.config"
+
+      - name: Verify toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source "$HOME/.cargo/env"
+          clang --version | head -n 1
+          ld.lld --version | head -n 1
+          make --version | head -n 1
+          python3 --version
+          bazel --version
+          repo version
+          rustc --version
+          bindgen --version
+          java -version
+          df -h /
+
+      - name: Compile bzImage and modules
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          rm -rf "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR"
+          mkdir -p "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR"
+          rm -f "$OUT_DIR/arch/x86/boot/bzImage" "$OUT_DIR/vmlinux" "$OUT_DIR/System.map"
+
+          BUILD_MARKER="$GITHUB_WORKSPACE/.build-start"
+          touch "$BUILD_MARKER"
+          START="$(date +%s)"
+
+          set +e
+          make \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            -j"$(nproc)" \
+            bzImage modules \
+            2>&1 | tee "$LOG_DIR/kernel-build.log"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            exit "$STATUS"
+          fi
+
+          RELEASE="$(make -s O="$OUT_DIR" ARCH=x86_64 LLVM=1 LLVM_IAS=1 kernelrelease)"
+          END="$(date +%s)"
+          SECONDS="$((END - START))"
+          BZIMAGE="$OUT_DIR/arch/x86/boot/bzImage"
+
+          test -s "$BZIMAGE"
+          test -s "$OUT_DIR/vmlinux"
+          test -s "$OUT_DIR/System.map"
+          test "$BZIMAGE" -nt "$BUILD_MARKER"
+
+          OBJECTS="$(find "$OUT_DIR" -type f -name '*.o' | wc -l)"
+          test "$OBJECTS" -gt 100
+
+          echo "KERNEL_RELEASE=$RELEASE" >> "$GITHUB_ENV"
+          echo "BUILD_SECONDS=$SECONDS" >> "$GITHUB_ENV"
+          echo "OBJECT_COUNT=$OBJECTS" >> "$GITHUB_ENV"
+
+          {
+            echo "## Zenith kernel compilation completed"
+            echo
+            echo "- Release: \`$RELEASE\`"
+            echo "- Duration: **$SECONDS seconds**"
+            echo "- Compiled object files: **$OBJECTS**"
+            echo "- bzImage size: **$(stat -c '%s' "$BZIMAGE") bytes**"
+            echo "- bzImage SHA-256: \`$(sha256sum "$BZIMAGE" | awk '{print $1}')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install and package modules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          make \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            INSTALL_MOD_PATH="$MODULES_DIR" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install \
+            2>&1 | tee "$LOG_DIR/modules-install.log"
+
+          rm -f \
+            "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/build" \
+            "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/source"
+
+          tar --zstd -cf "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst" -C "$MODULES_DIR" .
+
+      - name: Collect verified build outputs
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cp "$OUT_DIR/arch/x86/boot/bzImage" "$ARTIFACT_DIR/bzImage-${KERNEL_RELEASE}"
+          cp "$OUT_DIR/.config" "$ARTIFACT_DIR/config-${KERNEL_RELEASE}"
+          cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map-${KERNEL_RELEASE}"
+          zstd -T0 -19 "$LOG_DIR/kernel-build.log" -o "$ARTIFACT_DIR/kernel-build-${KERNEL_RELEASE}.log.zst"
+          zstd -T0 -19 "$LOG_DIR/modules-install.log" -o "$ARTIFACT_DIR/modules-install-${KERNEL_RELEASE}.log.zst"
+
+          cat > "$ARTIFACT_DIR/source-info.txt" <<EOF
+          Kernel repository: $KERNEL_REPO
+          Kernel branch: $KERNEL_BRANCH
+          Kernel commit: $(git -C "$KERNEL_DIR" rev-parse HEAD)
+          KernelSU Next repository: $KSU_REPO
+          KernelSU Next branch: $KSU_BRANCH
+          KernelSU Next commit: $KSU_COMMIT
+          x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
+          Kernel release: $KERNEL_RELEASE
+          Build duration seconds: $BUILD_SECONDS
+          Compiled object files: $OBJECT_COUNT
+          EOF
+
+          (
+            cd "$ARTIFACT_DIR"
+            sha256sum \
+              "bzImage-${KERNEL_RELEASE}" \
+              "config-${KERNEL_RELEASE}" \
+              "System.map-${KERNEL_RELEASE}" \
+              "modules-${KERNEL_RELEASE}.tar.zst" \
+              > SHA256SUMS
+          )
+
+          test -s "$ARTIFACT_DIR/bzImage-${KERNEL_RELEASE}"
+          cat "$ARTIFACT_DIR/SHA256SUMS"
+          du -sh "$ARTIFACT_DIR"/*
+
+      - name: Upload compiled kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-6.9-kernelsu-next-${{ github.run_number }}
+          path: build-artifacts/
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload diagnostics if build fails
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-6.9-failure-logs-${{ github.run_number }}
+          path: |
+            build-logs/
+            ${{ env.OUT_DIR }}/.config
+          retention-days: 7
+          if-no-files-found: warn
