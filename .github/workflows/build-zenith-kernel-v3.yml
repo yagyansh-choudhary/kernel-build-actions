@@ -199,6 +199,35 @@ jobs:
           echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
           git -C KernelSU-Next log -1 --oneline
 
+      - name: Patch KernelSU Next sulog init annotations
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          # KernelSU Next v3.3.0/dev declares __init and __exit in
+          # feature/sulog.h without including the header that defines them.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          header = Path("KernelSU-Next/kernel/feature/sulog.h")
+          text = header.read_text()
+          required = "#include <linux/init.h>"
+          marker = "#include <linux/types.h>"
+
+          if required not in text:
+              if marker not in text:
+                  raise SystemExit(f"Unexpected format in {header}")
+              text = text.replace(marker, required + "\n" + marker, 1)
+              header.write_text(text)
+
+          if required not in header.read_text().splitlines():
+              raise SystemExit(f"Failed to patch {header}")
+          PY
+
+          grep -nE '^#include <linux/(init|types)\.h>$' \
+            KernelSU-Next/kernel/feature/sulog.h
+
       - name: Integrate KernelSU Next and ensure x86_64 fix option exists
         shell: bash
         run: |
@@ -325,6 +354,7 @@ jobs:
 
           set +e
           make \
+            --output-sync=target \
             O="$OUT_DIR" \
             ARCH=x86_64 \
             LLVM=1 \
@@ -336,6 +366,22 @@ jobs:
           set -e
 
           if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "========== REAL BUILD ERRORS =========="
+            grep -nEi -B8 -A20 \
+              'fatal error:|(^|[^[:alpha:]])error:|ld\.lld: error:|clang: error:|undefined reference|LLVM ERROR|out of memory|No space left on device|Killed|internal compiler error' \
+              "$LOG_DIR/kernel-build.log" | head -n 500 || true
+
+            echo
+            echo "========== FINAL 300 LOG LINES =========="
+            tail -n 300 "$LOG_DIR/kernel-build.log" || true
+
+            echo
+            echo "========== RUNNER RESOURCES =========="
+            free -h || true
+            df -h || true
+            df -i || true
+
             exit "$STATUS"
           fi
 
