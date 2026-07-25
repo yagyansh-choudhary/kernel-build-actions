@@ -24,11 +24,13 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-24-v3-kconfig-grep-fix"
+      WORKFLOW_REVISION: "2026-07-25-v5-confirmed-lsm-preflight"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
+      KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
       KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
       KSU_BRANCH: dev
+      KSU_COMMIT: "d6a42fd9285c11b8e8e67bfe72a5050528006c00"
       KERNEL_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith
       OUT_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith/out
       CONFIG_FILE: ${{ github.workspace }}/kernel-configs/zenith-6.9-x86_64.config
@@ -59,12 +61,11 @@ jobs:
           free -h
           df -h /
 
-      - name: Update and upgrade Ubuntu
+      - name: Update Ubuntu package index
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get upgrade -y
 
       - name: Install kernel, Android, Bazel, Python and Rust prerequisites
         shell: bash
@@ -126,19 +127,19 @@ jobs:
           grep -qx 'CONFIG_OVERLAY_FS=y' "$CONFIG_FILE"
           sha256sum "$CONFIG_FILE"
 
-      - name: Clone only Zenith branch 6.9
+      - name: Clone pinned Zenith kernel revision
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf "$KERNEL_DIR"
           mkdir -p "$(dirname "$KERNEL_DIR")"
-          git clone \
-            --branch "$KERNEL_BRANCH" \
-            --single-branch \
-            --depth 1 \
-            "$KERNEL_REPO" \
-            "$KERNEL_DIR"
-          test "$(git -C "$KERNEL_DIR" branch --show-current)" = "$KERNEL_BRANCH"
+
+          git init "$KERNEL_DIR"
+          git -C "$KERNEL_DIR" remote add origin "$KERNEL_REPO"
+          git -C "$KERNEL_DIR" fetch --depth 1 origin "$KERNEL_COMMIT"
+          git -C "$KERNEL_DIR" checkout --detach FETCH_HEAD
+
+          test "$(git -C "$KERNEL_DIR" rev-parse HEAD)" = "$KERNEL_COMMIT"
           git -C "$KERNEL_DIR" log -1 --oneline
 
       - name: Remove old KernelSU tree and integration
@@ -175,16 +176,19 @@ jobs:
           test ! -e KernelSU
           test ! -e drivers/kernelsu
 
-      - name: Clone latest KernelSU Next dev tree
+      - name: Clone pinned KernelSU Next revision
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
           rm -rf KernelSU-Next
 
-          # Full clone avoids KernelSU's build logic trying to unshallow the repo later.
+          # Keep full branch history so KernelSU's version/tag calculation remains
+          # correct, then detach at the exact audited commit.
           git clone --branch "$KSU_BRANCH" --single-branch "$KSU_REPO" KernelSU-Next
+          git -C KernelSU-Next checkout --detach "$KSU_COMMIT"
 
+          test "$(git -C KernelSU-Next rev-parse HEAD)" = "$KSU_COMMIT"
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Kbuild
           test -f KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
@@ -196,38 +200,200 @@ jobs:
           grep -q 'patch_abs_jump("x64_sys_call"' \
             KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
 
-          echo "KSU_COMMIT=$(git -C KernelSU-Next rev-parse HEAD)" >> "$GITHUB_ENV"
           git -C KernelSU-Next log -1 --oneline
 
-      - name: Patch KernelSU Next sulog init annotations
+      - name: Apply audited KernelSU compatibility patch
         shell: bash
         run: |
           set -euxo pipefail
-          cd "$KERNEL_DIR"
+          cd "$KERNEL_DIR/KernelSU-Next"
 
-          # KernelSU Next v3.3.0/dev declares __init and __exit in
-          # feature/sulog.h without including the header that defines them.
-          python3 - <<'PY'
-          from pathlib import Path
+          # Audited against Zenith Linux 6.9.9 commit $KERNEL_COMMIT and
+          # KernelSU Next commit $KSU_COMMIT. This fixes three definite compile
+          # blockers and one Full-LTO stack-frame warning.
+          git apply --check - <<'PATCH'
+          diff --git a/kernel/feature/sulog.h b/kernel/feature/sulog.h
+          index f69494d..006ad71 100644
+          --- a/kernel/feature/sulog.h
+          +++ b/kernel/feature/sulog.h
+          @@ -1,6 +1,7 @@
+           #ifndef __KSU_H_SULOG
+           #define __KSU_H_SULOG
+           
+          +#include <linux/init.h>
+           #include <linux/types.h>
+           
+           bool ksu_sulog_is_enabled(void);
+          diff --git a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+          index 4598c6b..6e0df13 100644
+          --- a/kernel/hook/lsm_hook.c
+          +++ b/kernel/hook/lsm_hook.c
+          @@ -18,6 +18,11 @@ struct ksu_lsm_hook_entry {
+               struct ksu_lsm_hook *hook;
+           };
+           
+          +static const struct lsm_id ksu_lsm_id = {
+          +    .name = "ksu",
+          +    .id = LSM_ID_UNDEF,
+          +};
+          +
+           static DEFINE_MUTEX(ksu_lsm_hook_lock);
+           static struct ksu_lsm_hook_entry ksu_lsm_hook_entries[16];
+           static int ksu_lsm_hook_count;
+          @@ -343,7 +348,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
+                               hook->list.head = head;
+                               hook->list.list.next = NULL;
+                               hook->list.list.pprev = &head->first;
+          -                    hook->list.lsm = "ksu";
+          +                    hook->list.lsmid = &ksu_lsm_id;
+                               *(void **)((char *)selected_entry + hook->hook_offset) = hook->replacement;
+                               selected_slot = (void **)&head->first;
+                               selected_origin = NULL;
+          diff --git a/kernel/infra/file_wrapper.c b/kernel/infra/file_wrapper.c
+          index dbad19b..9f3a1b8 100644
+          --- a/kernel/infra/file_wrapper.c
+          +++ b/kernel/infra/file_wrapper.c
+          @@ -258,7 +258,7 @@ void ksu_wrapper_splice_eof(struct file *fp)
+           }
+           #endif
+           
+          -#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+          +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+           static int ksu_wrapper_setlease(struct file *fp, int arg1,
+                                           struct file_lease **fl, void **p)
+           {
+          diff --git a/kernel/manager/apk_sign.c b/kernel/manager/apk_sign.c
+          index 95beea8..a380c92 100644
+          --- a/kernel/manager/apk_sign.c
+          +++ b/kernel/manager/apk_sign.c
+          @@ -95,21 +95,28 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
+           		*offset += *size4;
+           
+           #define CERT_MAX_LENGTH 1024
+          -		char cert[CERT_MAX_LENGTH];
+          +		char *cert;
+          +		unsigned char digest[SHA256_DIGEST_SIZE];
+          +		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+          +
+           		if (*size4 > CERT_MAX_LENGTH) {
+           			pr_info("cert length overlimit\n");
+           			return false;
+           		}
+          +
+          +		cert = kmalloc(*size4, GFP_KERNEL);
+          +		if (!cert)
+          +			return false;
+          +
+           		kernel_read(fp, cert, *size4, pos);
+          -		unsigned char digest[SHA256_DIGEST_SIZE];
+          -		if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
+          +		if (ksu_sha256(cert, *size4, digest)) {
+           			pr_info("sha256 error\n");
+          +			kfree(cert);
+           			return false;
+           		}
+          +		kfree(cert);
+           
+          -		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+           		hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
+          -
+                   bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
+                   pr_info("sha256: %s, expected: %s\n", hash_str, expected_sha256);
+                   if (strcmp(expected_sha256, hash_str) == 0) {
+          PATCH
+          git apply - <<'PATCH'
+          diff --git a/kernel/feature/sulog.h b/kernel/feature/sulog.h
+          index f69494d..006ad71 100644
+          --- a/kernel/feature/sulog.h
+          +++ b/kernel/feature/sulog.h
+          @@ -1,6 +1,7 @@
+           #ifndef __KSU_H_SULOG
+           #define __KSU_H_SULOG
+           
+          +#include <linux/init.h>
+           #include <linux/types.h>
+           
+           bool ksu_sulog_is_enabled(void);
+          diff --git a/kernel/hook/lsm_hook.c b/kernel/hook/lsm_hook.c
+          index 4598c6b..6e0df13 100644
+          --- a/kernel/hook/lsm_hook.c
+          +++ b/kernel/hook/lsm_hook.c
+          @@ -18,6 +18,11 @@ struct ksu_lsm_hook_entry {
+               struct ksu_lsm_hook *hook;
+           };
+           
+          +static const struct lsm_id ksu_lsm_id = {
+          +    .name = "ksu",
+          +    .id = LSM_ID_UNDEF,
+          +};
+          +
+           static DEFINE_MUTEX(ksu_lsm_hook_lock);
+           static struct ksu_lsm_hook_entry ksu_lsm_hook_entries[16];
+           static int ksu_lsm_hook_count;
+          @@ -343,7 +348,7 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
+                               hook->list.head = head;
+                               hook->list.list.next = NULL;
+                               hook->list.list.pprev = &head->first;
+          -                    hook->list.lsm = "ksu";
+          +                    hook->list.lsmid = &ksu_lsm_id;
+                               *(void **)((char *)selected_entry + hook->hook_offset) = hook->replacement;
+                               selected_slot = (void **)&head->first;
+                               selected_origin = NULL;
+          diff --git a/kernel/infra/file_wrapper.c b/kernel/infra/file_wrapper.c
+          index dbad19b..9f3a1b8 100644
+          --- a/kernel/infra/file_wrapper.c
+          +++ b/kernel/infra/file_wrapper.c
+          @@ -258,7 +258,7 @@ void ksu_wrapper_splice_eof(struct file *fp)
+           }
+           #endif
+           
+          -#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+          +#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0)
+           static int ksu_wrapper_setlease(struct file *fp, int arg1,
+                                           struct file_lease **fl, void **p)
+           {
+          diff --git a/kernel/manager/apk_sign.c b/kernel/manager/apk_sign.c
+          index 95beea8..a380c92 100644
+          --- a/kernel/manager/apk_sign.c
+          +++ b/kernel/manager/apk_sign.c
+          @@ -95,21 +95,28 @@ static bool check_block(struct file *fp, u32 *size4, loff_t *pos, u32 *offset,
+           		*offset += *size4;
+           
+           #define CERT_MAX_LENGTH 1024
+          -		char cert[CERT_MAX_LENGTH];
+          +		char *cert;
+          +		unsigned char digest[SHA256_DIGEST_SIZE];
+          +		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+          +
+           		if (*size4 > CERT_MAX_LENGTH) {
+           			pr_info("cert length overlimit\n");
+           			return false;
+           		}
+          +
+          +		cert = kmalloc(*size4, GFP_KERNEL);
+          +		if (!cert)
+          +			return false;
+          +
+           		kernel_read(fp, cert, *size4, pos);
+          -		unsigned char digest[SHA256_DIGEST_SIZE];
+          -		if (IS_ERR(ksu_sha256(cert, *size4, digest))) {
+          +		if (ksu_sha256(cert, *size4, digest)) {
+           			pr_info("sha256 error\n");
+          +			kfree(cert);
+           			return false;
+           		}
+          +		kfree(cert);
+           
+          -		char hash_str[SHA256_DIGEST_SIZE * 2 + 1];
+           		hash_str[SHA256_DIGEST_SIZE * 2] = '\0';
+          -
+                   bin2hex(hash_str, digest, SHA256_DIGEST_SIZE);
+                   pr_info("sha256: %s, expected: %s\n", hash_str, expected_sha256);
+                   if (strcmp(expected_sha256, hash_str) == 0) {
+          PATCH
 
-          header = Path("KernelSU-Next/kernel/feature/sulog.h")
-          text = header.read_text()
-          required = "#include <linux/init.h>"
-          marker = "#include <linux/types.h>"
-
-          if required not in text:
-              if marker not in text:
-                  raise SystemExit(f"Unexpected format in {header}")
-              text = text.replace(marker, required + "\n" + marker, 1)
-              header.write_text(text)
-
-          if required not in header.read_text().splitlines():
-              raise SystemExit(f"Failed to patch {header}")
-          PY
-
-          grep -nE '^#include <linux/(init|types)\.h>$' \
-            KernelSU-Next/kernel/feature/sulog.h
-
+          git diff --check
+          git diff --stat
       - name: Integrate KernelSU Next and ensure x86_64 fix option exists
         shell: bash
         run: |
@@ -321,6 +487,45 @@ jobs:
           echo "=== Final key config options ==="
           grep -E '^CONFIG_(X86_64|MODULES|KSU|KSU_X86_PATCH_SYSCALL_DISPATCHER|KPROBES|KPROBES_ON_FTRACE|KPROBE_EVENTS|EXT4_FS|OVERLAY_FS|LTO_CLANG_FULL)=' "$OUT_DIR/.config"
 
+      - name: Preflight compile KernelSU subtree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          mkdir -p "$LOG_DIR"
+
+          START="$(date +%s)"
+          set +e
+          make \
+            --output-sync=target \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            V=1 \
+            -j2 \
+            drivers/kernelsu/ \
+            2>&1 | tee "$LOG_DIR/kernelsu-preflight.log"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "========== KERNELSU PREFLIGHT ERRORS =========="
+            grep -nEi -B8 -A20 \
+              'fatal error:|(^|[^[:alpha:]])error:|ld\.lld: error:|clang: error:|undefined reference|LLVM ERROR|internal compiler error' \
+              "$LOG_DIR/kernelsu-preflight.log" | head -n 500 || true
+            echo
+            echo "========== FINAL 300 PREFLIGHT LINES =========="
+            tail -n 300 "$LOG_DIR/kernelsu-preflight.log" || true
+            exit "$STATUS"
+          fi
+
+          test -s "$OUT_DIR/drivers/kernelsu/kernelsu.o"
+          END="$(date +%s)"
+          echo "KernelSU compile/link preflight passed in $((END - START)) seconds."
+          file "$OUT_DIR/drivers/kernelsu/kernelsu.o"
+
       - name: Verify toolchains
         shell: bash
         run: |
@@ -344,7 +549,7 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          rm -rf "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR"
+          rm -rf "$ARTIFACT_DIR" "$MODULES_DIR"
           mkdir -p "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR"
           rm -f "$OUT_DIR/arch/x86/boot/bzImage" "$OUT_DIR/vmlinux" "$OUT_DIR/System.map"
 
@@ -398,9 +603,13 @@ jobs:
           OBJECTS="$(find "$OUT_DIR" -type f -name '*.o' | wc -l)"
           test "$OBJECTS" -gt 100
 
+          grep -n 'warning:' "$LOG_DIR/kernel-build.log" > "$LOG_DIR/kernel-warnings.txt" || true
+          WARNING_COUNT="$(wc -l < "$LOG_DIR/kernel-warnings.txt")"
+
           echo "KERNEL_RELEASE=$RELEASE" >> "$GITHUB_ENV"
           echo "BUILD_SECONDS=$SECONDS" >> "$GITHUB_ENV"
           echo "OBJECT_COUNT=$OBJECTS" >> "$GITHUB_ENV"
+          echo "WARNING_COUNT=$WARNING_COUNT" >> "$GITHUB_ENV"
 
           {
             echo "## Zenith kernel compilation completed"
@@ -408,6 +617,7 @@ jobs:
             echo "- Release: \`$RELEASE\`"
             echo "- Duration: **$SECONDS seconds**"
             echo "- Compiled object files: **$OBJECTS**"
+            echo "- Compiler/linker warnings: **$WARNING_COUNT**"
             echo "- bzImage size: **$(stat -c '%s' "$BZIMAGE") bytes**"
             echo "- bzImage SHA-256: \`$(sha256sum "$BZIMAGE" | awk '{print $1}')\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -443,19 +653,28 @@ jobs:
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/config-${KERNEL_RELEASE}"
           cp "$OUT_DIR/System.map" "$ARTIFACT_DIR/System.map-${KERNEL_RELEASE}"
           zstd -T0 -19 "$LOG_DIR/kernel-build.log" -o "$ARTIFACT_DIR/kernel-build-${KERNEL_RELEASE}.log.zst"
+          if [ -s "$LOG_DIR/kernelsu-preflight.log" ]; then
+            zstd -T0 -19 "$LOG_DIR/kernelsu-preflight.log" \
+              -o "$ARTIFACT_DIR/kernelsu-preflight-${KERNEL_RELEASE}.log.zst"
+          fi
+          if [ -s "$LOG_DIR/kernel-warnings.txt" ]; then
+            cp "$LOG_DIR/kernel-warnings.txt" "$ARTIFACT_DIR/kernel-warnings-${KERNEL_RELEASE}.txt"
+          fi
           zstd -T0 -19 "$LOG_DIR/modules-install.log" -o "$ARTIFACT_DIR/modules-install-${KERNEL_RELEASE}.log.zst"
 
           cat > "$ARTIFACT_DIR/source-info.txt" <<EOF
           Kernel repository: $KERNEL_REPO
           Kernel branch: $KERNEL_BRANCH
-          Kernel commit: $(git -C "$KERNEL_DIR" rev-parse HEAD)
+          Kernel commit (pinned): $KERNEL_COMMIT
           KernelSU Next repository: $KSU_REPO
           KernelSU Next branch: $KSU_BRANCH
-          KernelSU Next commit: $KSU_COMMIT
+          KernelSU Next commit (pinned): $KSU_COMMIT
+          Compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
           x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
           Kernel release: $KERNEL_RELEASE
           Build duration seconds: $BUILD_SECONDS
           Compiled object files: $OBJECT_COUNT
+          Compiler/linker warnings: $WARNING_COUNT
           EOF
 
           (
