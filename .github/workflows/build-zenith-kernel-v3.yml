@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-26-v7-kernelsu-builtin-archive-preflight"
+      WORKFLOW_REVISION: "2026-07-26-v8-zero-warning-source-cleanup"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -394,6 +394,792 @@ jobs:
 
           git diff --check
           git diff --stat
+
+      - name: Apply Zenith source warning cleanup patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          mkdir -p "$LOG_DIR"
+
+          # Source-level fixes for all 25 warning diagnostics observed in the
+          # successful 6.9.9-zenith Full-LTO build. Do not hide diagnostics by
+          # raising CONFIG_FRAME_WARN or globally disabling warning classes.
+          cat > "$RUNNER_TEMP/zenith-6.9-warning-cleanup.patch" <<'PATCH'
+          diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+          --- a/arch/x86/kernel/cpu/intel.c
+          +++ b/arch/x86/kernel/cpu/intel.c
+          @@ -355,7 +355,7 @@
+           		switch (c->x86_model) {
+           		case INTEL_FAM6_ATOM_SILVERMONT:
+           			set_cpu_cap(c, X86_FEATURE_TSC_RELIABLE);
+          -			/* Fall through */
+          +			fallthrough;
+           		case INTEL_FAM6_ATOM_SALTWELL_MID:
+           		case INTEL_FAM6_ATOM_SALTWELL_TABLET:
+           		case INTEL_FAM6_ATOM_SILVERMONT_MID:
+          diff --git a/drivers/bluetooth/Makefile b/drivers/bluetooth/Makefile
+          --- a/drivers/bluetooth/Makefile
+          +++ b/drivers/bluetooth/Makefile
+          @@ -3,6 +3,7 @@
+           # Makefile for the Linux Bluetooth HCI device drivers.
+           #
+           
+          +CFLAGS_hci_vhci.o += -fno-optimize-sibling-calls
+           obj-$(CONFIG_BT_HCIVHCI)	+= hci_vhci.o
+           obj-$(CONFIG_BT_HCIUART)	+= hci_uart.o
+           obj-$(CONFIG_BT_HCIBCM203X)	+= bcm203x.o
+          diff --git a/drivers/bluetooth/hci_vhci.c b/drivers/bluetooth/hci_vhci.c
+          --- a/drivers/bluetooth/hci_vhci.c
+          +++ b/drivers/bluetooth/hci_vhci.c
+          @@ -289,18 +289,18 @@
+           
+           static void vhci_coredump_hdr(struct hci_dev *hdev, struct sk_buff *skb)
+           {
+          -	char buf[80];
+          -
+          -	snprintf(buf, sizeof(buf), "Controller Name: vhci_ctrl\n");
+          +	const char *buf;
+          +
+          +	buf = "Controller Name: vhci_ctrl\n";
+           	skb_put_data(skb, buf, strlen(buf));
+           
+          -	snprintf(buf, sizeof(buf), "Firmware Version: vhci_fw\n");
+          +	buf = "Firmware Version: vhci_fw\n";
+           	skb_put_data(skb, buf, strlen(buf));
+           
+          -	snprintf(buf, sizeof(buf), "Driver: vhci_drv\n");
+          +	buf = "Driver: vhci_drv\n";
+           	skb_put_data(skb, buf, strlen(buf));
+           
+          -	snprintf(buf, sizeof(buf), "Vendor: vhci\n");
+          +	buf = "Vendor: vhci\n";
+           	skb_put_data(skb, buf, strlen(buf));
+           }
+           
+          diff --git a/drivers/crypto/ccp/ccp-ops.c b/drivers/crypto/ccp/ccp-ops.c
+          --- a/drivers/crypto/ccp/ccp-ops.c
+          +++ b/drivers/crypto/ccp/ccp-ops.c
+          @@ -12,6 +12,7 @@
+           #include <linux/module.h>
+           #include <linux/kernel.h>
+           #include <linux/interrupt.h>
+          +#include <linux/slab.h>
+           #include <crypto/scatterwalk.h>
+           #include <crypto/des.h>
+           #include <linux/ccp.h>
+          @@ -644,10 +645,10 @@
+           	__be64 *final;
+           	int ret;
+           
+          -	struct scatterlist *p_inp, sg_inp[2];
+          -	struct scatterlist *p_tag, sg_tag[2];
+          -	struct scatterlist *p_outp, sg_outp[2];
+          -	struct scatterlist *p_aad;
+          +	struct scatterlist *p_inp, *sg_inp;
+          +	struct scatterlist *p_tag, *sg_tag;
+          +	struct scatterlist *p_outp, *sg_outp;
+          +	struct scatterlist *p_aad, *sgl;
+           
+           	if (!aes->iv)
+           		return -EINVAL;
+          @@ -675,6 +676,13 @@
+           		return -EINVAL;
+           	}
+           
+          +	sgl = kcalloc(6, sizeof(*sgl), GFP_KERNEL);
+          +	if (!sgl)
+          +		return -ENOMEM;
+          +	sg_inp = sgl;
+          +	sg_tag = sgl + 2;
+          +	sg_outp = sgl + 4;
+          +
+           	/* First, decompose the source buffer into AAD & PT,
+           	 * and the destination buffer into AAD, CT & tag, or
+           	 * the input into CT & tag.
+          @@ -708,7 +716,7 @@
+           				   CCP_AES_CTX_SB_COUNT * CCP_SB_BYTES,
+           				   DMA_TO_DEVICE);
+           	if (ret)
+          -		return ret;
+          +		goto e_sgl;
+           
+           	dm_offset = CCP_SB_BYTES - aes->key_len;
+           	ret = ccp_set_dm_area(&key, dm_offset, aes->key, 0, aes->key_len);
+          @@ -909,6 +917,8 @@
+           e_key:
+           	ccp_dm_free(&key);
+           
+          +e_sgl:
+          +	kfree(sgl);
+           	return ret;
+           }
+           
+          diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+          --- a/drivers/gpu/drm/radeon/radeon_cs.c
+          +++ b/drivers/gpu/drm/radeon/radeon_cs.c
+          @@ -27,6 +27,7 @@
+           
+           #include <linux/list_sort.h>
+           #include <linux/pci.h>
+          +#include <linux/slab.h>
+           #include <linux/uaccess.h>
+           
+           #include <drm/drm_device.h>
+          @@ -669,64 +670,66 @@
+           int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+           {
+           	struct radeon_device *rdev = dev->dev_private;
+          -	struct radeon_cs_parser parser;
+          +	struct radeon_cs_parser *parser;
+           	int r;
+          +
+          +	parser = kzalloc(sizeof(*parser), GFP_KERNEL);
+          +	if (!parser)
+          +		return -ENOMEM;
+           
+           	down_read(&rdev->exclusive_lock);
+           	if (!rdev->accel_working) {
+           		up_read(&rdev->exclusive_lock);
+          -		return -EBUSY;
+          +		r = -EBUSY;
+          +		goto out_free;
+           	}
+           	if (rdev->in_reset) {
+           		up_read(&rdev->exclusive_lock);
+           		r = radeon_gpu_reset(rdev);
+           		if (!r)
+           			r = -EAGAIN;
+          -		return r;
+          +		goto out_free;
+           	}
+           	/* initialize parser */
+          -	memset(&parser, 0, sizeof(struct radeon_cs_parser));
+          -	parser.filp = filp;
+          -	parser.rdev = rdev;
+          -	parser.dev = rdev->dev;
+          -	parser.family = rdev->family;
+          -	r = radeon_cs_parser_init(&parser, data);
+          +	parser->filp = filp;
+          +	parser->rdev = rdev;
+          +	parser->dev = rdev->dev;
+          +	parser->family = rdev->family;
+          +	r = radeon_cs_parser_init(parser, data);
+           	if (r) {
+           		DRM_ERROR("Failed to initialize parser !\n");
+          -		radeon_cs_parser_fini(&parser, r, false);
+          +		radeon_cs_parser_fini(parser, r, false);
+           		up_read(&rdev->exclusive_lock);
+           		r = radeon_cs_handle_lockup(rdev, r);
+          -		return r;
+          -	}
+          -
+          -	r = radeon_cs_ib_fill(rdev, &parser);
+          +		goto out_free;
+          +	}
+          +
+          +	r = radeon_cs_ib_fill(rdev, parser);
+           	if (!r) {
+          -		r = radeon_cs_parser_relocs(&parser);
+          +		r = radeon_cs_parser_relocs(parser);
+           		if (r && r != -ERESTARTSYS)
+           			DRM_ERROR("Failed to parse relocation %d!\n", r);
+           	}
+           
+           	if (r) {
+          -		radeon_cs_parser_fini(&parser, r, false);
+          +		radeon_cs_parser_fini(parser, r, false);
+           		up_read(&rdev->exclusive_lock);
+           		r = radeon_cs_handle_lockup(rdev, r);
+          -		return r;
+          -	}
+          -
+          -	trace_radeon_cs(&parser);
+          -
+          -	r = radeon_cs_ib_chunk(rdev, &parser);
+          -	if (r) {
+          +		goto out_free;
+          +	}
+          +
+          +	trace_radeon_cs(parser);
+          +
+          +	r = radeon_cs_ib_chunk(rdev, parser);
+          +	if (r)
+           		goto out;
+          -	}
+          -	r = radeon_cs_ib_vm_chunk(rdev, &parser);
+          -	if (r) {
+          -		goto out;
+          -	}
+          +	r = radeon_cs_ib_vm_chunk(rdev, parser);
+           out:
+          -	radeon_cs_parser_fini(&parser, r, true);
+          +	radeon_cs_parser_fini(parser, r, true);
+           	up_read(&rdev->exclusive_lock);
+           	r = radeon_cs_handle_lockup(rdev, r);
+          +out_free:
+          +	kfree(parser);
+           	return r;
+           }
+           
+          diff --git a/drivers/hwmon/oxp-sensors.c b/drivers/hwmon/oxp-sensors.c
+          --- a/drivers/hwmon/oxp-sensors.c
+          +++ b/drivers/hwmon/oxp-sensors.c
+          @@ -509,6 +509,7 @@
+           			default:
+           				break;
+           			}
+          +			break;
+           		default:
+           			break;
+           		}
+          @@ -586,6 +587,7 @@
+           			default:
+           				break;
+           			}
+          +			break;
+           		default:
+           			break;
+           		}
+          @@ -641,6 +643,7 @@
+           			default:
+           				break;
+           			}
+          +			break;
+           		default:
+           			break;
+           		}
+          diff --git a/drivers/i2c/busses/i2c-nct6775.c b/drivers/i2c/busses/i2c-nct6775.c
+          --- a/drivers/i2c/busses/i2c-nct6775.c
+          +++ b/drivers/i2c/busses/i2c-nct6775.c
+          @@ -219,6 +219,7 @@
+           			break;
+           		case I2C_SMBUS_BYTE_DATA:
+           			tmp_data.byte = data->byte;
+          +			fallthrough;
+           		case I2C_SMBUS_BYTE:
+           			outb_p((addr << 1) | read_write,
+           			       SMBHSTADD);
+          diff --git a/drivers/input/mouse/vmmouse.c b/drivers/input/mouse/vmmouse.c
+          --- a/drivers/input/mouse/vmmouse.c
+          +++ b/drivers/input/mouse/vmmouse.c
+          @@ -433,7 +433,7 @@
+           int vmmouse_init(struct psmouse *psmouse)
+           {
+           	struct vmmouse_data *priv;
+          -	struct input_dev *rel_dev = psmouse->dev, *abs_dev;
+          +	struct input_dev *abs_dev;
+           	int error;
+           
+           	psmouse_reset(psmouse);
+          diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
+          --- a/drivers/net/ethernet/Makefile
+          +++ b/drivers/net/ethernet/Makefile
+          @@ -51,6 +51,7 @@
+           obj-$(CONFIG_NET_VENDOR_I825XX) += i825xx/
+           obj-$(CONFIG_NET_VENDOR_MICROSOFT) += microsoft/
+           obj-$(CONFIG_NET_VENDOR_XSCALE) += xscale/
+          +CFLAGS_jme.o += -fno-optimize-sibling-calls
+           obj-$(CONFIG_JME) += jme.o
+           obj-$(CONFIG_KORINA) += korina.o
+           obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+          diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
+          --- a/drivers/net/wireguard/allowedips.c
+          +++ b/drivers/net/wireguard/allowedips.c
+          @@ -5,8 +5,6 @@
+           
+           #include "allowedips.h"
+           #include "peer.h"
+          -
+          -enum { MAX_ALLOWEDIPS_DEPTH = 129 };
+           
+           static struct kmem_cache *node_cache;
+           
+          @@ -38,44 +36,78 @@
+           	return (key[node->bit_at_a] >> node->bit_at_b) & 1;
+           }
+           
+          -static void push_rcu(struct allowedips_node **stack,
+          -		     struct allowedips_node __rcu *p, unsigned int *len)
+          -{
+          -	if (rcu_access_pointer(p)) {
+          -		if (WARN_ON(IS_ENABLED(DEBUG) && *len >= MAX_ALLOWEDIPS_DEPTH))
+          -			return;
+          -		stack[(*len)++] = rcu_dereference_raw(p);
+          -	}
+          -}
+          -
+           static void node_free_rcu(struct rcu_head *rcu)
+           {
+           	kmem_cache_free(node_cache, container_of(rcu, struct allowedips_node, rcu));
+           }
+           
+          +static struct allowedips_node *node_parent(struct allowedips_node *node)
+          +{
+          +	unsigned long packed = node->parent_bit_packed;
+          +	unsigned int bit = packed & 3;
+          +	struct allowedips_node __rcu **parent_bit;
+          +
+          +	if (bit > 1)
+          +		return NULL;
+          +
+          +	parent_bit = (struct allowedips_node __rcu **)(packed & ~3UL);
+          +	return container_of(parent_bit - bit, struct allowedips_node, bit[0]);
+          +}
+          +
+           static void root_free_rcu(struct rcu_head *rcu)
+           {
+          -	struct allowedips_node *node, *stack[MAX_ALLOWEDIPS_DEPTH] = {
+          -		container_of(rcu, struct allowedips_node, rcu) };
+          -	unsigned int len = 1;
+          -
+          -	while (len > 0 && (node = stack[--len])) {
+          -		push_rcu(stack, node->bit[0], &len);
+          -		push_rcu(stack, node->bit[1], &len);
+          -		kmem_cache_free(node_cache, node);
+          +	struct allowedips_node *node = container_of(rcu, struct allowedips_node, rcu);
+          +	struct allowedips_node *prev = NULL;
+          +
+          +	while (node) {
+          +		struct allowedips_node *parent = node_parent(node);
+          +		struct allowedips_node *left = rcu_dereference_raw(node->bit[0]);
+          +		struct allowedips_node *right = rcu_dereference_raw(node->bit[1]);
+          +		struct allowedips_node *next;
+          +
+          +		if (prev == parent && left) {
+          +			next = left;
+          +		} else if ((prev == parent || prev == left) && right) {
+          +			next = right;
+          +		} else {
+          +			next = parent;
+          +			kmem_cache_free(node_cache, node);
+          +		}
+          +
+          +		prev = node;
+          +		node = next;
+           	}
+           }
+           
+           static void root_remove_peer_lists(struct allowedips_node *root)
+           {
+          -	struct allowedips_node *node, *stack[MAX_ALLOWEDIPS_DEPTH] = { root };
+          -	unsigned int len = 1;
+          -
+          -	while (len > 0 && (node = stack[--len])) {
+          -		push_rcu(stack, node->bit[0], &len);
+          -		push_rcu(stack, node->bit[1], &len);
+          -		if (rcu_access_pointer(node->peer))
+          -			list_del(&node->peer_list);
+          +	struct allowedips_node *node = root;
+          +	struct allowedips_node *prev = NULL;
+          +
+          +	while (node) {
+          +		struct allowedips_node *parent = node_parent(node);
+          +		struct allowedips_node *left = rcu_dereference_raw(node->bit[0]);
+          +		struct allowedips_node *right = rcu_dereference_raw(node->bit[1]);
+          +		struct allowedips_node *next;
+          +
+          +		if (prev == parent) {
+          +			if (rcu_access_pointer(node->peer))
+          +				list_del(&node->peer_list);
+          +
+          +			if (left)
+          +				next = left;
+          +			else if (right)
+          +				next = right;
+          +			else
+          +				next = parent;
+          +		} else if (prev == left && right) {
+          +			next = right;
+          +		} else {
+          +			next = parent;
+          +		}
+          +
+          +		prev = node;
+          +		node = next;
+           	}
+           }
+           
+          diff --git a/drivers/platform/x86/legion-laptop.c b/drivers/platform/x86/legion-laptop.c
+          --- a/drivers/platform/x86/legion-laptop.c
+          +++ b/drivers/platform/x86/legion-laptop.c
+          @@ -5593,7 +5593,7 @@
+           	priv->adev = adev;
+           	if (!priv->adev) {
+           		dev_info(dev, "Could not get ACPI handle\n");
+          -		goto err_acpi_init;
+          +		return -ENODEV;
+           	}
+           
+           	skip_acpi_sta_check = force || (!priv->conf->acpi_check_dev);
+          diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
+          --- a/drivers/xen/gntdev.c
+          +++ b/drivers/xen/gntdev.c
+          @@ -953,36 +953,39 @@
+           static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
+           {
+           	struct ioctl_gntdev_grant_copy copy;
+          -	struct gntdev_copy_batch batch;
+          +	struct gntdev_copy_batch *batch;
+           	unsigned int i;
+           	int ret = 0;
+           
+           	if (copy_from_user(&copy, u, sizeof(copy)))
+           		return -EFAULT;
+           
+          -	batch.nr_ops = 0;
+          -	batch.nr_pages = 0;
+          +	batch = kzalloc(sizeof(*batch), GFP_KERNEL);
+          +	if (!batch)
+          +		return -ENOMEM;
+           
+           	for (i = 0; i < copy.count; i++) {
+           		struct gntdev_grant_copy_segment seg;
+           
+           		if (copy_from_user(&seg, &copy.segments[i], sizeof(seg))) {
+           			ret = -EFAULT;
+          -			goto out;
+          -		}
+          -
+          -		ret = gntdev_grant_copy_seg(&batch, &seg, &copy.segments[i].status);
+          +			goto out_put_pages;
+          +		}
+          +
+          +		ret = gntdev_grant_copy_seg(batch, &seg, &copy.segments[i].status);
+           		if (ret < 0)
+          -			goto out;
+          +			goto out_put_pages;
+           
+           		cond_resched();
+           	}
+          -	if (batch.nr_ops)
+          -		ret = gntdev_copy(&batch);
+          -	return ret;
+          -
+          -  out:
+          -	gntdev_put_pages(&batch);
+          +	if (batch->nr_ops)
+          +		ret = gntdev_copy(batch);
+          +	goto out_free;
+          +
+          +out_put_pages:
+          +	gntdev_put_pages(batch);
+          +out_free:
+          +	kfree(batch);
+           	return ret;
+           }
+           
+          diff --git a/fs/bcachefs/checksum.c b/fs/bcachefs/checksum.c
+          --- a/fs/bcachefs/checksum.c
+          +++ b/fs/bcachefs/checksum.c
+          @@ -324,7 +324,7 @@
+           {
+           	struct bio_vec bv;
+           	struct bvec_iter iter;
+          -	struct scatterlist sgl[16], *sg = sgl;
+          +	struct scatterlist sgl[8], *sg = sgl;
+           	size_t bytes = 0;
+           	int ret = 0;
+           
+          @@ -351,6 +351,9 @@
+           		sg_set_page(sg++, bv.bv_page, bv.bv_len, bv.bv_offset);
+           		bytes += bv.bv_len;
+           	}
+          +
+          +	if (!bytes)
+          +		return 0;
+           
+           	sg_mark_end(sg - 1);
+           	return do_encrypt_sg(c->chacha20, nonce, sgl, bytes);
+          diff --git a/fs/bcachefs/fsck.c b/fs/bcachefs/fsck.c
+          --- a/fs/bcachefs/fsck.c
+          +++ b/fs/bcachefs/fsck.c
+          @@ -19,6 +19,7 @@
+           
+           #include <linux/bsearch.h>
+           #include <linux/dcache.h> /* struct qstr */
+          +#include <linux/slab.h>
+           
+           /*
+            * XXX: this is handling transaction restarts without returning
+          @@ -288,13 +289,18 @@
+           			  u32 inode_snapshot)
+           {
+           	struct bch_hash_info dir_hash;
+          -	struct bch_inode_unpacked lostfound;
+          +	struct bch_inode_unpacked *lostfound;
+           	char name_buf[20];
+           	struct qstr name;
+           	u64 dir_offset = 0;
+           	u32 dirent_snapshot = inode_snapshot;
+           	int ret;
+           
+          +	lostfound = bch2_trans_kmalloc(trans, sizeof(*lostfound));
+          +	ret = PTR_ERR_OR_ZERO(lostfound);
+          +	if (ret)
+          +		return ret;
+          +
+           	if (inode->bi_subvol) {
+           		inode->bi_parent_subvol = BCACHEFS_ROOT_SUBVOL;
+           
+          @@ -309,24 +315,24 @@
+           		snprintf(name_buf, sizeof(name_buf), "%llu", inode->bi_inum);
+           	}
+           
+          -	ret = lookup_lostfound(trans, dirent_snapshot, &lostfound, inode->bi_inum);
+          +	ret = lookup_lostfound(trans, dirent_snapshot, lostfound, inode->bi_inum);
+           	if (ret)
+           		return ret;
+           
+           	if (S_ISDIR(inode->bi_mode)) {
+          -		lostfound.bi_nlink++;
+          -
+          -		ret = __bch2_fsck_write_inode(trans, &lostfound, U32_MAX);
+          +		lostfound->bi_nlink++;
+          +
+          +		ret = __bch2_fsck_write_inode(trans, lostfound, U32_MAX);
+           		if (ret)
+           			return ret;
+           	}
+           
+          -	dir_hash = bch2_hash_info_init(trans->c, &lostfound);
+          +	dir_hash = bch2_hash_info_init(trans->c, lostfound);
+           
+           	name = (struct qstr) QSTR(name_buf);
+           
+           	ret = bch2_dirent_create_snapshot(trans,
+          -				inode->bi_parent_subvol, lostfound.bi_inum,
+          +				inode->bi_parent_subvol, lostfound->bi_inum,
+           				dirent_snapshot,
+           				&dir_hash,
+           				inode_d_type(inode),
+          @@ -337,7 +343,7 @@
+           	if (ret)
+           		return ret;
+           
+          -	inode->bi_dir		= lostfound.bi_inum;
+          +	inode->bi_dir		= lostfound->bi_inum;
+           	inode->bi_dir_offset	= dir_offset;
+           
+           	return __bch2_fsck_write_inode(trans, inode, inode_snapshot);
+          @@ -2175,32 +2181,46 @@
+           	return ret;
+           }
+           
+          +struct bch2_check_dirents_state {
+          +	struct inode_walker dir;
+          +	struct inode_walker target;
+          +	struct snapshots_seen snapshots;
+          +	struct bch_hash_info hash_info;
+          +};
+          +
+           /*
+            * Walk dirents: verify that they all have a corresponding S_ISDIR inode,
+            * validate d_type
+            */
+           int bch2_check_dirents(struct bch_fs *c)
+           {
+          -	struct inode_walker dir = inode_walker_init();
+          -	struct inode_walker target = inode_walker_init();
+          -	struct snapshots_seen s;
+          -	struct bch_hash_info hash_info;
+          -
+          -	snapshots_seen_init(&s);
+          -
+          -	int ret = bch2_trans_run(c,
+          +	struct bch2_check_dirents_state *state;
+          +	int ret;
+          +
+          +	state = kzalloc(sizeof(*state), GFP_KERNEL);
+          +	if (!state)
+          +		return -ENOMEM;
+          +
+          +	state->dir = inode_walker_init();
+          +	state->target = inode_walker_init();
+          +	snapshots_seen_init(&state->snapshots);
+          +
+          +	ret = bch2_trans_run(c,
+           		for_each_btree_key_commit(trans, iter, BTREE_ID_dirents,
+           				POS(BCACHEFS_ROOT_INO, 0),
+           				BTREE_ITER_PREFETCH|BTREE_ITER_ALL_SNAPSHOTS,
+           				k,
+           				NULL, NULL,
+           				BCH_TRANS_COMMIT_no_enospc,
+          -			check_dirent(trans, &iter, k, &hash_info, &dir, &target, &s)) ?:
+          -		check_subdir_count_notnested(trans, &dir));
+          -
+          -	snapshots_seen_exit(&s);
+          -	inode_walker_exit(&dir);
+          -	inode_walker_exit(&target);
+          +			check_dirent(trans, &iter, k, &state->hash_info,
+          +				     &state->dir, &state->target,
+          +				     &state->snapshots)) ?:
+          +		check_subdir_count_notnested(trans, &state->dir));
+          +
+          +	snapshots_seen_exit(&state->snapshots);
+          +	inode_walker_exit(&state->dir);
+          +	inode_walker_exit(&state->target);
+          +	kfree(state);
+           	bch_err_fn(c, ret);
+           	return ret;
+           }
+          diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+          --- a/fs/f2fs/data.c
+          +++ b/fs/f2fs/data.c
+          @@ -3239,9 +3239,10 @@
+           	return false;
+           }
+           
+          -static int __f2fs_write_data_pages(struct address_space *mapping,
+          -						struct writeback_control *wbc,
+          -						enum iostat_type io_type)
+          +static noinline_for_stack int
+          +__f2fs_write_data_pages(struct address_space *mapping,
+          +			struct writeback_control *wbc,
+          +			enum iostat_type io_type)
+           {
+           	struct inode *inode = mapping->host;
+           	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+          diff --git a/include/linux/poll.h b/include/linux/poll.h
+          --- a/include/linux/poll.h
+          +++ b/include/linux/poll.h
+          @@ -17,7 +17,8 @@
+           #define MAX_STACK_ALLOC 832
+           #define FRONTEND_STACK_ALLOC	256
+           #define SELECT_STACK_ALLOC	FRONTEND_STACK_ALLOC
+          -#define POLL_STACK_ALLOC	FRONTEND_STACK_ALLOC
+          +/* Leave additional headroom for Clang Full-LTO in do_sys_poll(). */
+          +#define POLL_STACK_ALLOC	128
+           #define WQUEUES_STACK_ALLOC	(MAX_STACK_ALLOC - FRONTEND_STACK_ALLOC)
+           #define N_INLINE_POLL_ENTRIES	(WQUEUES_STACK_ALLOC / sizeof(struct poll_table_entry))
+           
+          diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+          --- a/lib/maple_tree.c
+          +++ b/lib/maple_tree.c
+          @@ -4148,7 +4148,7 @@
+            *
+            * This is where split, rebalance end up.
+            */
+          -static void mas_wr_bnode(struct ma_wr_state *wr_mas)
+          +static noinline_for_stack void mas_wr_bnode(struct ma_wr_state *wr_mas)
+           {
+           	struct maple_big_node b_node;
+           
+          diff --git a/lib/zstd/common/entropy_common.c b/lib/zstd/common/entropy_common.c
+          --- a/lib/zstd/common/entropy_common.c
+          +++ b/lib/zstd/common/entropy_common.c
+          @@ -248,6 +248,7 @@
+               @return : size read from `src` , or an error Code .
+               Note : Needed by HUF_readCTable() and HUF_readDTableX?() .
+           */
+          +noinline
+           size_t HUF_readStats(BYTE* huffWeight, size_t hwSize, U32* rankStats,
+                                U32* nbSymbolsPtr, U32* tableLogPtr,
+                                const void* src, size_t srcSize)
+          diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+          --- a/net/ipv4/tcp_bbr.c
+          +++ b/net/ipv4/tcp_bbr.c
+          @@ -1077,9 +1077,7 @@
+           
+           	/* See if we should use ECN sender logic for this connection. */
+           	if (!bbr->ecn_eligible && bbr_can_use_ecn(sk) &&
+          -	    bbr_param(sk, ecn_factor) &&
+          -	    (bbr->min_rtt_us <= bbr_ecn_max_rtt_us ||
+          -	     !bbr_ecn_max_rtt_us))
+          +	    bbr->min_rtt_us <= bbr_ecn_max_rtt_us)
+           		bbr->ecn_eligible = 1;
+           
+           	/* Skip updating alpha only if not ECN-eligible and PLB is disabled. */
+          @@ -1184,7 +1182,7 @@
+           	}
+           
+           	if (rs->delivered_ce > 0 && rs->delivered > 0 &&
+          -	    bbr->ecn_eligible && bbr_param(sk, ecn_thresh)) {
+          +	    bbr->ecn_eligible) {
+           		ecn_thresh = (u64)rs->delivered * bbr_param(sk, ecn_thresh) >>
+           				BBR_SCALE;
+           		if (rs->delivered_ce > ecn_thresh) {
+          @@ -1382,7 +1380,7 @@
+           		return;
+           
+           	/* ECN response. */
+          -	if (bbr->ecn_in_round && bbr_param(sk, ecn_factor)) {
+          +	if (bbr->ecn_in_round) {
+           		bbr_init_lower_bounds(sk, false);
+           		bbr_ecn_lower_bounds(sk, &ecn_inflight_lo);
+           	}
+          diff --git a/sound/pci/hda/cs35l41_hda_property.c b/sound/pci/hda/cs35l41_hda_property.c
+          --- a/sound/pci/hda/cs35l41_hda_property.c
+          +++ b/sound/pci/hda/cs35l41_hda_property.c
+          @@ -429,16 +429,28 @@
+           static int asus_rog_2023_ally_fix(struct cs35l41_hda *cs35l41, struct device *physdev, int id,
+           				const char *hid)
+           {
+          -	const char *rog_ally_bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
+          -	const char *rog_ally_bios_num = rog_ally_bios_ver + 6; // Dropping the RC71L. part before the number
+          +	const char *rog_ally_bios_ver;
+          +	const char *rog_ally_bios_num;
+          +	struct cs35l41_hw_cfg *hw_cfg = &cs35l41->hw_cfg;
+           	int rog_ally_bios_int;
+          -	kstrtoint(rog_ally_bios_num, 10, &rog_ally_bios_int);
+          -	if(rog_ally_bios_int >= 330){
+          -		printk(KERN_INFO "DSD properties exist in the %d BIOS. Not applying DSD override...\n", rog_ally_bios_int);
+          -		return -ENOENT; //Patch not applicable. Exiting...
+          -	}
+          -
+          -	struct cs35l41_hw_cfg *hw_cfg = &cs35l41->hw_cfg;
+          +	int ret;
+          +
+          +	rog_ally_bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
+          +	if (!rog_ally_bios_ver || strncmp(rog_ally_bios_ver, "RC71L.", 6))
+          +		return -EINVAL;
+          +
+          +	/* Drop the RC71L. prefix before parsing the numeric BIOS version. */
+          +	rog_ally_bios_num = rog_ally_bios_ver + 6;
+          +	ret = kstrtoint(rog_ally_bios_num, 10, &rog_ally_bios_int);
+          +	if (ret)
+          +		return ret;
+          +
+          +	if (rog_ally_bios_int >= 330) {
+          +		dev_info(cs35l41->dev,
+          +			 "DSD properties exist in BIOS %d; skipping override\n",
+          +			 rog_ally_bios_int);
+          +		return -ENOENT;
+          +	}
+           
+           	dev_info(cs35l41->dev, "Adding DSD properties for %s\n", cs35l41->acpi_subsystem_id);
+           
+          PATCH
+
+          git apply --check "$RUNNER_TEMP/zenith-6.9-warning-cleanup.patch"
+          git apply "$RUNNER_TEMP/zenith-6.9-warning-cleanup.patch"
+          git diff --check
+
+          # Verify the key warning fixes were applied to the pinned tree.
+          grep -q 'fallthrough;' arch/x86/kernel/cpu/intel.c
+          grep -q 'CFLAGS_jme.o += -fno-optimize-sibling-calls' \
+            drivers/net/ethernet/Makefile
+          grep -q 'CFLAGS_hci_vhci.o += -fno-optimize-sibling-calls' \
+            drivers/bluetooth/Makefile
+          grep -q 'static noinline_for_stack int' fs/f2fs/data.c
+          grep -q 'static noinline_for_stack void mas_wr_bnode' lib/maple_tree.c
+          grep -q '^noinline$' lib/zstd/common/entropy_common.c
+          grep -q '#define POLL_STACK_ALLOC[[:space:]]*128' include/linux/poll.h
+
+          "$KERNEL_DIR/scripts/checkpatch.pl" --no-tree --strict \
+            "$RUNNER_TEMP/zenith-6.9-warning-cleanup.patch" \
+            > "$LOG_DIR/warning-cleanup-checkpatch.log" 2>&1 || {
+              status=$?
+              cat "$LOG_DIR/warning-cleanup-checkpatch.log"
+              # The audited patch has no ERROR or WARNING diagnostics. Treat
+              # either as fatal while allowing non-fatal CHECK suggestions.
+              if grep -qE '^(ERROR|WARNING):' \
+                "$LOG_DIR/warning-cleanup-checkpatch.log"; then
+                exit "$status"
+              fi
+            }
+          cat "$LOG_DIR/warning-cleanup-checkpatch.log"
+
       - name: Integrate KernelSU Next and ensure x86_64 fix option exists
         shell: bash
         run: |
@@ -598,6 +1384,77 @@ jobs:
           file "$KSU_ARCHIVE"
           llvm-ar t "$KSU_ARCHIVE"
 
+
+      - name: Preflight compile warning-cleanup targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          mkdir -p "$LOG_DIR"
+
+          # Compile every translation unit touched by the warning patch before
+          # starting the long all-driver build. The final LTO warning gate below
+          # still validates warnings that only appear while linking vmlinux.
+          WARNING_TARGETS=(
+            arch/x86/kernel/cpu/intel.o
+            sound/pci/hda/cs35l41_hda_property.o
+            net/ipv4/tcp_bbr.o
+            drivers/input/mouse/vmmouse.o
+            drivers/i2c/busses/i2c-nct6775.o
+            drivers/hwmon/oxp-sensors.o
+            drivers/platform/x86/legion-laptop.o
+            drivers/xen/gntdev.o
+            drivers/gpu/drm/radeon/radeon_cs.o
+            drivers/crypto/ccp/ccp-ops.o
+            fs/select.o
+            fs/f2fs/data.o
+            fs/bcachefs/checksum.o
+            fs/bcachefs/fsck.o
+            lib/zstd/common/entropy_common.o
+            drivers/net/wireguard/allowedips.o
+            lib/maple_tree.o
+            drivers/bluetooth/hci_vhci.o
+            drivers/net/ethernet/jme.o
+          )
+
+          START="$(date +%s)"
+          set +e
+          make \
+            --output-sync=target \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            V=1 \
+            -j2 \
+            "${WARNING_TARGETS[@]}" \
+            2>&1 | tee "$LOG_DIR/warning-cleanup-preflight.log"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "========== WARNING-CLEANUP PREFLIGHT ERRORS =========="
+            grep -nEi -B8 -A20 \
+              '^[^[:space:]].*:[0-9]+:[0-9]+: (fatal )?error:|^ld\.lld: error:|^clang: error:|undefined reference|LLVM ERROR|internal compiler error' \
+              "$LOG_DIR/warning-cleanup-preflight.log" | head -n 500 || true
+            echo
+            echo "========== FINAL 300 PREFLIGHT LINES =========="
+            tail -n 300 "$LOG_DIR/warning-cleanup-preflight.log" || true
+            exit "$STATUS"
+          fi
+
+          grep -nEi 'warning:' "$LOG_DIR/warning-cleanup-preflight.log" \
+            > "$LOG_DIR/warning-cleanup-preflight-warnings.txt" || true
+          if [ -s "$LOG_DIR/warning-cleanup-preflight-warnings.txt" ]; then
+            echo "Warning-cleanup preflight still emitted diagnostics:" >&2
+            cat "$LOG_DIR/warning-cleanup-preflight-warnings.txt" >&2
+            exit 1
+          fi
+
+          END="$(date +%s)"
+          echo "Warning-cleanup target preflight passed with zero warnings in $((END - START)) seconds."
+
       - name: Verify toolchains
         shell: bash
         run: |
@@ -716,6 +1573,53 @@ jobs:
 
           tar --zstd -cf "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst" -C "$MODULES_DIR" .
 
+
+      - name: Enforce zero-warning build gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+          : > "$LOG_DIR/all-build-warnings.txt"
+
+          for log_name in \
+            warning-cleanup-checkpatch.log \
+            selinux-generated-headers.log \
+            kernelsu-preflight.log \
+            warning-cleanup-preflight.log \
+            kernel-build.log \
+            modules-install.log; do
+            log_path="$LOG_DIR/$log_name"
+            [ -f "$log_path" ] || continue
+
+            # checkpatch CHECK messages are style advisories, not compiler or
+            # linker warnings. Its actual WARNING diagnostics are caught by the
+            # patch-application step above.
+            if [ "$log_name" = warning-cleanup-checkpatch.log ]; then
+              continue
+            fi
+
+            grep -nEi 'warning:' "$log_path" | \
+              sed "s#^#$log_name:#" >> "$LOG_DIR/all-build-warnings.txt" || true
+          done
+
+          WARNING_COUNT="$(wc -l < "$LOG_DIR/all-build-warnings.txt")"
+          echo "WARNING_COUNT=$WARNING_COUNT" >> "$GITHUB_ENV"
+
+          if [ "$WARNING_COUNT" -ne 0 ]; then
+            echo "Zero-warning gate failed: $WARNING_COUNT warning diagnostics remain." >&2
+            cat "$LOG_DIR/all-build-warnings.txt" >&2
+            exit 1
+          fi
+
+          : > "$LOG_DIR/kernel-warnings.txt"
+          echo "Zero-warning gate passed: no compiler, linker, objtool, modpost, or module-install warning diagnostics were found."
+          {
+            echo
+            echo "## Zero-warning validation"
+            echo
+            echo "All audited source targets, the Full-LTO kernel build, and module installation completed with **0 warning diagnostics**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Collect verified build outputs
         shell: bash
         run: |
@@ -729,6 +1633,14 @@ jobs:
             zstd -T0 -19 "$LOG_DIR/kernelsu-preflight.log" \
               -o "$ARTIFACT_DIR/kernelsu-preflight-${KERNEL_RELEASE}.log.zst"
           fi
+          if [ -s "$LOG_DIR/warning-cleanup-preflight.log" ]; then
+            zstd -T0 -19 "$LOG_DIR/warning-cleanup-preflight.log" \
+              -o "$ARTIFACT_DIR/warning-cleanup-preflight-${KERNEL_RELEASE}.log.zst"
+          fi
+          if [ -s "$LOG_DIR/warning-cleanup-checkpatch.log" ]; then
+            zstd -T0 -19 "$LOG_DIR/warning-cleanup-checkpatch.log" \
+              -o "$ARTIFACT_DIR/warning-cleanup-checkpatch-${KERNEL_RELEASE}.log.zst"
+          fi
           if [ -s "$LOG_DIR/kernel-warnings.txt" ]; then
             cp "$LOG_DIR/kernel-warnings.txt" "$ARTIFACT_DIR/kernel-warnings-${KERNEL_RELEASE}.txt"
           fi
@@ -741,7 +1653,9 @@ jobs:
           KernelSU Next repository: $KSU_REPO
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
-          Compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
+          KernelSU compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
+          Zenith warning cleanup: source/codegen fixes for all 25 diagnostics observed in the successful baseline build
+          Warning policy: zero compiler, linker, objtool, modpost, or module-install warning diagnostics permitted
           x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
           Kernel release: $KERNEL_RELEASE
           Build duration seconds: $BUILD_SECONDS
