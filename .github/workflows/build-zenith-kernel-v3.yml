@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-25-v6-selinux-generated-headers"
+      WORKFLOW_REVISION: "2026-07-26-v7-kernelsu-builtin-archive-preflight"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -567,10 +567,36 @@ jobs:
             exit "$STATUS"
           fi
 
-          test -s "$OUT_DIR/drivers/kernelsu/kernelsu.o"
+          # CONFIG_KSU=y builds the subtree into a built-in thin archive.
+          # A standalone `drivers/kernelsu/` target does not create kernelsu.o;
+          # expecting that non-existent file caused the previous false failure
+          # even though all 35 KernelSU translation units compiled successfully.
+          KSU_ARCHIVE="$OUT_DIR/drivers/kernelsu/built-in.a"
+          test -s "$KSU_ARCHIVE"
+
+          mapfile -t KSU_OBJECTS < <(llvm-ar t "$KSU_ARCHIVE" | sed '/^[[:space:]]*$/d')
+          if [ "${#KSU_OBJECTS[@]}" -ne 35 ]; then
+            echo "Expected 35 KernelSU objects, found ${#KSU_OBJECTS[@]}" >&2
+            printf '%s\n' "${KSU_OBJECTS[@]}" >&2
+            exit 1
+          fi
+
+          for required_object in \
+            feature/sulog.o \
+            hook/lsm_hook.o \
+            infra/file_wrapper.o \
+            manager/apk_sign.o \
+            hook/x86_64/syscall_hook.o; do
+            printf '%s\n' "${KSU_OBJECTS[@]}" | grep -Fq "drivers/kernelsu/${required_object}" || {
+              echo "Missing required KernelSU archive member: ${required_object}" >&2
+              exit 1
+            }
+          done
+
           END="$(date +%s)"
-          echo "KernelSU compile/link preflight passed in $((END - START)) seconds."
-          file "$OUT_DIR/drivers/kernelsu/kernelsu.o"
+          echo "KernelSU 35/35 object compile preflight passed in $((END - START)) seconds."
+          file "$KSU_ARCHIVE"
+          llvm-ar t "$KSU_ARCHIVE"
 
       - name: Verify toolchains
         shell: bash
