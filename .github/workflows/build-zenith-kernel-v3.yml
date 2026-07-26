@@ -499,12 +499,17 @@ jobs:
           # drivers/kernelsu/ target does not carry SELinux's normal Kbuild
           # dependency that creates this header. Generate both SELinux headers
           # explicitly before the isolated KernelSU preflight.
+          # The top-level Makefile does not expose an arbitrary host-tool
+          # binary as a direct target. Build the configured host scripts via
+          # the supported `scripts` target; CONFIG_SECURITY_SELINUX=y makes
+          # Kbuild descend into scripts/selinux/genheaders.
           make \
+            --output-sync=target \
             O="$OUT_DIR" \
             ARCH=x86_64 \
             LLVM=1 \
             LLVM_IAS=1 \
-            scripts/selinux/genheaders/genheaders
+            scripts
 
           mkdir -p "$OUT_DIR/security/selinux"
           "$OUT_DIR/scripts/selinux/genheaders/genheaders" \
