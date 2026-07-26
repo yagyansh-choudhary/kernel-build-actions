@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-25-v5-confirmed-lsm-preflight"
+      WORKFLOW_REVISION: "2026-07-25-v6-selinux-generated-headers"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -487,12 +487,53 @@ jobs:
           echo "=== Final key config options ==="
           grep -E '^CONFIG_(X86_64|MODULES|KSU|KSU_X86_PATCH_SYSCALL_DISPATCHER|KPROBES|KPROBES_ON_FTRACE|KPROBE_EVENTS|EXT4_FS|OVERLAY_FS|LTO_CLANG_FULL)=' "$OUT_DIR/.config"
 
+      - name: Generate SELinux headers required by KernelSU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          mkdir -p "$LOG_DIR"
+
+          # KernelSU's file_wrapper.c includes SELinux objsec.h directly.
+          # objsec.h includes generated flask.h, but a standalone
+          # drivers/kernelsu/ target does not carry SELinux's normal Kbuild
+          # dependency that creates this header. Generate both SELinux headers
+          # explicitly before the isolated KernelSU preflight.
+          make \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            scripts/selinux/genheaders/genheaders
+
+          mkdir -p "$OUT_DIR/security/selinux"
+          "$OUT_DIR/scripts/selinux/genheaders/genheaders" \
+            "$OUT_DIR/security/selinux/flask.h" \
+            "$OUT_DIR/security/selinux/av_permissions.h"
+
+          test -s "$OUT_DIR/security/selinux/flask.h"
+          test -s "$OUT_DIR/security/selinux/av_permissions.h"
+          grep -q '^#define SECCLASS_' "$OUT_DIR/security/selinux/flask.h"
+          grep -q '^#define .*__.* 0x' "$OUT_DIR/security/selinux/av_permissions.h"
+          {
+            echo "Generated SELinux headers for isolated KernelSU preflight"
+            ls -lh \
+              "$OUT_DIR/security/selinux/flask.h" \
+              "$OUT_DIR/security/selinux/av_permissions.h"
+            sha256sum \
+              "$OUT_DIR/security/selinux/flask.h" \
+              "$OUT_DIR/security/selinux/av_permissions.h"
+          } | tee "$LOG_DIR/selinux-generated-headers.log"
+
       - name: Preflight compile KernelSU subtree
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           mkdir -p "$LOG_DIR"
+
+          test -s "$OUT_DIR/security/selinux/flask.h"
+          test -s "$OUT_DIR/security/selinux/av_permissions.h"
 
           START="$(date +%s)"
           set +e
@@ -513,7 +554,7 @@ jobs:
             echo
             echo "========== KERNELSU PREFLIGHT ERRORS =========="
             grep -nEi -B8 -A20 \
-              'fatal error:|(^|[^[:alpha:]])error:|ld\.lld: error:|clang: error:|undefined reference|LLVM ERROR|internal compiler error' \
+              '^[^[:space:]].*:[0-9]+:[0-9]+: (fatal )?error:|^ld\.lld: error:|^clang: error:|undefined reference|LLVM ERROR|internal compiler error' \
               "$LOG_DIR/kernelsu-preflight.log" | head -n 500 || true
             echo
             echo "========== FINAL 300 PREFLIGHT LINES =========="
@@ -574,7 +615,7 @@ jobs:
             echo
             echo "========== REAL BUILD ERRORS =========="
             grep -nEi -B8 -A20 \
-              'fatal error:|(^|[^[:alpha:]])error:|ld\.lld: error:|clang: error:|undefined reference|LLVM ERROR|out of memory|No space left on device|Killed|internal compiler error' \
+              '^[^[:space:]].*:[0-9]+:[0-9]+: (fatal )?error:|^ld\.lld: error:|^clang: error:|undefined reference|LLVM ERROR|out of memory|No space left on device|Killed|internal compiler error' \
               "$LOG_DIR/kernel-build.log" | head -n 500 || true
 
             echo
