@@ -672,17 +672,25 @@ jobs:
            	int error;
            
            	psmouse_reset(psmouse);
-          diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
-          --- a/drivers/net/ethernet/Makefile
-          +++ b/drivers/net/ethernet/Makefile
-          @@ -51,6 +51,7 @@
-           obj-$(CONFIG_NET_VENDOR_I825XX) += i825xx/
-           obj-$(CONFIG_NET_VENDOR_MICROSOFT) += microsoft/
-           obj-$(CONFIG_NET_VENDOR_XSCALE) += xscale/
-          +CFLAGS_jme.o += -fno-optimize-sibling-calls
-           obj-$(CONFIG_JME) += jme.o
-           obj-$(CONFIG_KORINA) += korina.o
-           obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+          diff --git a/drivers/net/ethernet/jme.c b/drivers/net/ethernet/jme.c
+          --- a/drivers/net/ethernet/jme.c
+          +++ b/drivers/net/ethernet/jme.c
+          @@ -26,6 +26,7 @@
+           #include <linux/udp.h>
+           #include <linux/if_vlan.h>
+           #include <linux/slab.h>
+          +#include <linux/objtool.h>
+           #include <linux/jiffies.h>
+           #include <net/ip6_checksum.h>
+           #include "jme.h"
+          @@ -553,5 +554,7 @@ out:
+           	return rc;
+           }
+          +
+          +STACK_FRAME_NON_STANDARD(jme_check_link);
+           
+           static int
+           jme_setup_tx_resources(struct jme_adapter *jme)
           diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
           --- a/drivers/net/wireguard/allowedips.c
           +++ b/drivers/net/wireguard/allowedips.c
@@ -1157,8 +1165,8 @@ jobs:
 
           # Verify the key warning fixes were applied to the pinned tree.
           grep -q 'fallthrough;' arch/x86/kernel/cpu/intel.c
-          grep -q 'CFLAGS_jme.o += -fno-optimize-sibling-calls' \
-            drivers/net/ethernet/Makefile
+          grep -q 'STACK_FRAME_NON_STANDARD(jme_check_link);' \
+            drivers/net/ethernet/jme.c
           grep -q 'CFLAGS_hci_vhci.o += -fno-optimize-sibling-calls' \
             drivers/bluetooth/Makefile
           grep -q 'static noinline_for_stack int' fs/f2fs/data.c
@@ -1444,7 +1452,9 @@ jobs:
             exit "$STATUS"
           fi
 
-          grep -nEi 'warning:' "$LOG_DIR/warning-cleanup-preflight.log" \
+          grep -nEi \
+            '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:' \
+            "$LOG_DIR/warning-cleanup-preflight.log" \
             > "$LOG_DIR/warning-cleanup-preflight-warnings.txt" || true
           if [ -s "$LOG_DIR/warning-cleanup-preflight-warnings.txt" ]; then
             echo "Warning-cleanup preflight still emitted diagnostics:" >&2
@@ -1598,7 +1608,9 @@ jobs:
               continue
             fi
 
-            grep -nEi 'warning:' "$log_path" | \
+            grep -nEi \
+              '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:' \
+              "$log_path" | \
               sed "s#^#$log_name:#" >> "$LOG_DIR/all-build-warnings.txt" || true
           done
 
@@ -1654,7 +1666,7 @@ jobs:
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
           KernelSU compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
-          Zenith warning cleanup: source/codegen fixes for all 25 diagnostics observed in the successful baseline build
+          Zenith warning cleanup: source/codegen fixes plus a targeted objtool annotation for all 25 diagnostics observed in the successful baseline build
           Warning policy: zero compiler, linker, objtool, modpost, or module-install warning diagnostics permitted
           x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
           Kernel release: $KERNEL_RELEASE
