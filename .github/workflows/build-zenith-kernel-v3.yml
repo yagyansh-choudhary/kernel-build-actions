@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-26-v8-zero-warning-source-cleanup"
+      WORKFLOW_REVISION: "2026-07-27-v9-f2fs-lto-frame-fix"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -407,9 +407,10 @@ jobs:
           # raising CONFIG_FRAME_WARN or globally disabling warning classes.
           cat > "$RUNNER_TEMP/zenith-6.9-warning-cleanup.patch" <<'PATCH'
           diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+          index 136fb8df8..eb97d4fdd 100644
           --- a/arch/x86/kernel/cpu/intel.c
           +++ b/arch/x86/kernel/cpu/intel.c
-          @@ -355,7 +355,7 @@
+          @@ -355,7 +355,7 @@ static void early_init_intel(struct cpuinfo_x86 *c)
            		switch (c->x86_model) {
            		case INTEL_FAM6_ATOM_SILVERMONT:
            			set_cpu_cap(c, X86_FEATURE_TSC_RELIABLE);
@@ -419,6 +420,7 @@ jobs:
            		case INTEL_FAM6_ATOM_SALTWELL_TABLET:
            		case INTEL_FAM6_ATOM_SILVERMONT_MID:
           diff --git a/drivers/bluetooth/Makefile b/drivers/bluetooth/Makefile
+          index 7a5967e9a..846d49dd1 100644
           --- a/drivers/bluetooth/Makefile
           +++ b/drivers/bluetooth/Makefile
           @@ -3,6 +3,7 @@
@@ -430,17 +432,17 @@ jobs:
            obj-$(CONFIG_BT_HCIUART)	+= hci_uart.o
            obj-$(CONFIG_BT_HCIBCM203X)	+= bcm203x.o
           diff --git a/drivers/bluetooth/hci_vhci.c b/drivers/bluetooth/hci_vhci.c
+          index 28750a40f..4bfc78f97 100644
           --- a/drivers/bluetooth/hci_vhci.c
           +++ b/drivers/bluetooth/hci_vhci.c
-          @@ -289,18 +289,18 @@
+          @@ -289,18 +289,18 @@ static void vhci_coredump(struct hci_dev *hdev)
            
            static void vhci_coredump_hdr(struct hci_dev *hdev, struct sk_buff *skb)
            {
           -	char buf[80];
-          -
-          -	snprintf(buf, sizeof(buf), "Controller Name: vhci_ctrl\n");
           +	const char *buf;
-          +
+           
+          -	snprintf(buf, sizeof(buf), "Controller Name: vhci_ctrl\n");
           +	buf = "Controller Name: vhci_ctrl\n";
            	skb_put_data(skb, buf, strlen(buf));
            
@@ -458,6 +460,7 @@ jobs:
            }
            
           diff --git a/drivers/crypto/ccp/ccp-ops.c b/drivers/crypto/ccp/ccp-ops.c
+          index cb8e99936..9d3758440 100644
           --- a/drivers/crypto/ccp/ccp-ops.c
           +++ b/drivers/crypto/ccp/ccp-ops.c
           @@ -12,6 +12,7 @@
@@ -468,7 +471,7 @@ jobs:
            #include <crypto/scatterwalk.h>
            #include <crypto/des.h>
            #include <linux/ccp.h>
-          @@ -644,10 +645,10 @@
+          @@ -644,10 +645,10 @@ ccp_run_aes_gcm_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
            	__be64 *final;
            	int ret;
            
@@ -483,7 +486,7 @@ jobs:
            
            	if (!aes->iv)
            		return -EINVAL;
-          @@ -675,6 +676,13 @@
+          @@ -675,6 +676,13 @@ ccp_run_aes_gcm_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
            		return -EINVAL;
            	}
            
@@ -497,7 +500,7 @@ jobs:
            	/* First, decompose the source buffer into AAD & PT,
            	 * and the destination buffer into AAD, CT & tag, or
            	 * the input into CT & tag.
-          @@ -708,7 +716,7 @@
+          @@ -708,7 +716,7 @@ ccp_run_aes_gcm_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
            				   CCP_AES_CTX_SB_COUNT * CCP_SB_BYTES,
            				   DMA_TO_DEVICE);
            	if (ret)
@@ -506,7 +509,7 @@ jobs:
            
            	dm_offset = CCP_SB_BYTES - aes->key_len;
            	ret = ccp_set_dm_area(&key, dm_offset, aes->key, 0, aes->key_len);
-          @@ -909,6 +917,8 @@
+          @@ -909,6 +917,8 @@ ccp_run_aes_gcm_cmd(struct ccp_cmd_queue *cmd_q, struct ccp_cmd *cmd)
            e_key:
            	ccp_dm_free(&key);
            
@@ -516,6 +519,7 @@ jobs:
            }
            
           diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+          index a6700d727..575eec15e 100644
           --- a/drivers/gpu/drm/radeon/radeon_cs.c
           +++ b/drivers/gpu/drm/radeon/radeon_cs.c
           @@ -27,6 +27,7 @@
@@ -526,18 +530,18 @@ jobs:
            #include <linux/uaccess.h>
            
            #include <drm/drm_device.h>
-          @@ -669,64 +670,66 @@
+          @@ -669,64 +670,66 @@ static int radeon_cs_ib_fill(struct radeon_device *rdev, struct radeon_cs_parser
            int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
            {
            	struct radeon_device *rdev = dev->dev_private;
           -	struct radeon_cs_parser parser;
           +	struct radeon_cs_parser *parser;
            	int r;
-          +
+           
           +	parser = kzalloc(sizeof(*parser), GFP_KERNEL);
           +	if (!parser)
           +		return -ENOMEM;
-           
+          +
            	down_read(&rdev->exclusive_lock);
            	if (!rdev->accel_working) {
            		up_read(&rdev->exclusive_lock);
@@ -572,12 +576,10 @@ jobs:
            		up_read(&rdev->exclusive_lock);
            		r = radeon_cs_handle_lockup(rdev, r);
           -		return r;
-          -	}
-          -
-          -	r = radeon_cs_ib_fill(rdev, &parser);
           +		goto out_free;
-          +	}
-          +
+           	}
+           
+          -	r = radeon_cs_ib_fill(rdev, &parser);
           +	r = radeon_cs_ib_fill(rdev, parser);
            	if (!r) {
           -		r = radeon_cs_parser_relocs(&parser);
@@ -592,24 +594,21 @@ jobs:
            		up_read(&rdev->exclusive_lock);
            		r = radeon_cs_handle_lockup(rdev, r);
           -		return r;
-          -	}
-          -
+          +		goto out_free;
+           	}
+           
           -	trace_radeon_cs(&parser);
-          -
+          +	trace_radeon_cs(parser);
+           
           -	r = radeon_cs_ib_chunk(rdev, &parser);
           -	if (r) {
-          +		goto out_free;
-          +	}
-          +
-          +	trace_radeon_cs(parser);
-          +
-          +	r = radeon_cs_ib_chunk(rdev, parser);
-          +	if (r)
-           		goto out;
+          -		goto out;
           -	}
           -	r = radeon_cs_ib_vm_chunk(rdev, &parser);
           -	if (r) {
-          -		goto out;
+          +	r = radeon_cs_ib_chunk(rdev, parser);
+          +	if (r)
+           		goto out;
           -	}
           +	r = radeon_cs_ib_vm_chunk(rdev, parser);
            out:
@@ -623,9 +622,10 @@ jobs:
            }
            
           diff --git a/drivers/hwmon/oxp-sensors.c b/drivers/hwmon/oxp-sensors.c
+          index 9c601131a..142325517 100644
           --- a/drivers/hwmon/oxp-sensors.c
           +++ b/drivers/hwmon/oxp-sensors.c
-          @@ -509,6 +509,7 @@
+          @@ -509,6 +509,7 @@ static int oxp_platform_read(struct device *dev, enum hwmon_sensor_types type,
            			default:
            				break;
            			}
@@ -633,7 +633,7 @@ jobs:
            		default:
            			break;
            		}
-          @@ -586,6 +587,7 @@
+          @@ -586,6 +587,7 @@ static int oxp_platform_read(struct device *dev, enum hwmon_sensor_types type,
            			default:
            				break;
            			}
@@ -641,7 +641,7 @@ jobs:
            		default:
            			break;
            		}
-          @@ -641,6 +643,7 @@
+          @@ -641,6 +643,7 @@ static int oxp_platform_write(struct device *dev, enum hwmon_sensor_types type,
            			default:
            				break;
            			}
@@ -650,9 +650,10 @@ jobs:
            			break;
            		}
           diff --git a/drivers/i2c/busses/i2c-nct6775.c b/drivers/i2c/busses/i2c-nct6775.c
+          index 0462f0952..e919d1e10 100644
           --- a/drivers/i2c/busses/i2c-nct6775.c
           +++ b/drivers/i2c/busses/i2c-nct6775.c
-          @@ -219,6 +219,7 @@
+          @@ -219,6 +219,7 @@ static s32 nct6775_access(struct i2c_adapter * adap, u16 addr,
            			break;
            		case I2C_SMBUS_BYTE_DATA:
            			tmp_data.byte = data->byte;
@@ -661,9 +662,10 @@ jobs:
            			outb_p((addr << 1) | read_write,
            			       SMBHSTADD);
           diff --git a/drivers/input/mouse/vmmouse.c b/drivers/input/mouse/vmmouse.c
+          index 01cc296c1..2c742aaf2 100644
           --- a/drivers/input/mouse/vmmouse.c
           +++ b/drivers/input/mouse/vmmouse.c
-          @@ -433,7 +433,7 @@
+          @@ -433,7 +433,7 @@ static int vmmouse_reconnect(struct psmouse *psmouse)
            int vmmouse_init(struct psmouse *psmouse)
            {
            	struct vmmouse_data *priv;
@@ -673,9 +675,10 @@ jobs:
            
            	psmouse_reset(psmouse);
           diff --git a/drivers/net/ethernet/jme.c b/drivers/net/ethernet/jme.c
+          index 1732ec3c3..5f3bed840 100644
           --- a/drivers/net/ethernet/jme.c
           +++ b/drivers/net/ethernet/jme.c
-          @@ -26,6 +26,7 @@
+          @@ -28,6 +28,7 @@
            #include <linux/udp.h>
            #include <linux/if_vlan.h>
            #include <linux/slab.h>
@@ -683,47 +686,48 @@ jobs:
            #include <linux/jiffies.h>
            #include <net/ip6_checksum.h>
            #include "jme.h"
-          @@ -553,5 +554,7 @@ out:
+          @@ -553,6 +554,8 @@ jme_check_link(struct net_device *netdev, int testonly)
            	return rc;
            }
-          +
-          +STACK_FRAME_NON_STANDARD(jme_check_link);
            
+          +STACK_FRAME_NON_STANDARD(jme_check_link);
+          +
            static int
            jme_setup_tx_resources(struct jme_adapter *jme)
+           {
           diff --git a/drivers/net/wireguard/allowedips.c b/drivers/net/wireguard/allowedips.c
+          index 0ba714ca5..1366b97e2 100644
           --- a/drivers/net/wireguard/allowedips.c
           +++ b/drivers/net/wireguard/allowedips.c
-          @@ -5,8 +5,6 @@
-           
+          @@ -6,8 +6,6 @@
            #include "allowedips.h"
            #include "peer.h"
-          -
-          -enum { MAX_ALLOWEDIPS_DEPTH = 129 };
            
+          -enum { MAX_ALLOWEDIPS_DEPTH = 129 };
+          -
            static struct kmem_cache *node_cache;
            
-          @@ -38,44 +36,78 @@
+           static void swap_endian(u8 *dst, const u8 *src, u8 bits)
+          @@ -38,44 +36,78 @@ static inline u8 choose(struct allowedips_node *node, const u8 *key)
            	return (key[node->bit_at_a] >> node->bit_at_b) & 1;
            }
            
           -static void push_rcu(struct allowedips_node **stack,
           -		     struct allowedips_node __rcu *p, unsigned int *len)
-          -{
+          +static void node_free_rcu(struct rcu_head *rcu)
+           {
           -	if (rcu_access_pointer(p)) {
           -		if (WARN_ON(IS_ENABLED(DEBUG) && *len >= MAX_ALLOWEDIPS_DEPTH))
           -			return;
           -		stack[(*len)++] = rcu_dereference_raw(p);
           -	}
-          -}
-          -
-           static void node_free_rcu(struct rcu_head *rcu)
-           {
-           	kmem_cache_free(node_cache, container_of(rcu, struct allowedips_node, rcu));
+          +	kmem_cache_free(node_cache, container_of(rcu, struct allowedips_node, rcu));
            }
            
+          -static void node_free_rcu(struct rcu_head *rcu)
           +static struct allowedips_node *node_parent(struct allowedips_node *node)
-          +{
+           {
+          -	kmem_cache_free(node_cache, container_of(rcu, struct allowedips_node, rcu));
           +	unsigned long packed = node->parent_bit_packed;
           +	unsigned int bit = packed & 3;
           +	struct allowedips_node __rcu **parent_bit;
@@ -733,8 +737,8 @@ jobs:
           +
           +	parent_bit = (struct allowedips_node __rcu **)(packed & ~3UL);
           +	return container_of(parent_bit - bit, struct allowedips_node, bit[0]);
-          +}
-          +
+           }
+           
            static void root_free_rcu(struct rcu_head *rcu)
            {
           -	struct allowedips_node *node, *stack[MAX_ALLOWEDIPS_DEPTH] = {
@@ -772,12 +776,6 @@ jobs:
            {
           -	struct allowedips_node *node, *stack[MAX_ALLOWEDIPS_DEPTH] = { root };
           -	unsigned int len = 1;
-          -
-          -	while (len > 0 && (node = stack[--len])) {
-          -		push_rcu(stack, node->bit[0], &len);
-          -		push_rcu(stack, node->bit[1], &len);
-          -		if (rcu_access_pointer(node->peer))
-          -			list_del(&node->peer_list);
           +	struct allowedips_node *node = root;
           +	struct allowedips_node *prev = NULL;
           +
@@ -802,16 +800,22 @@ jobs:
           +		} else {
           +			next = parent;
           +		}
-          +
+           
+          -	while (len > 0 && (node = stack[--len])) {
+          -		push_rcu(stack, node->bit[0], &len);
+          -		push_rcu(stack, node->bit[1], &len);
+          -		if (rcu_access_pointer(node->peer))
+          -			list_del(&node->peer_list);
           +		prev = node;
           +		node = next;
            	}
            }
            
           diff --git a/drivers/platform/x86/legion-laptop.c b/drivers/platform/x86/legion-laptop.c
+          index 5ec0a518f..78d6fc0c6 100644
           --- a/drivers/platform/x86/legion-laptop.c
           +++ b/drivers/platform/x86/legion-laptop.c
-          @@ -5593,7 +5593,7 @@
+          @@ -5593,7 +5593,7 @@ static int acpi_init(struct legion_private *priv, struct acpi_device *adev)
            	priv->adev = adev;
            	if (!priv->adev) {
            		dev_info(dev, "Could not get ACPI handle\n");
@@ -821,9 +825,10 @@ jobs:
            
            	skip_acpi_sta_check = force || (!priv->conf->acpi_check_dev);
           diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
+          index 61faea1f0..d9accf458 100644
           --- a/drivers/xen/gntdev.c
           +++ b/drivers/xen/gntdev.c
-          @@ -953,36 +953,39 @@
+          @@ -953,36 +953,39 @@ static int gntdev_grant_copy_seg(struct gntdev_copy_batch *batch,
            static long gntdev_ioctl_grant_copy(struct gntdev_priv *priv, void __user *u)
            {
            	struct ioctl_gntdev_grant_copy copy;
@@ -847,12 +852,10 @@ jobs:
            		if (copy_from_user(&seg, &copy.segments[i], sizeof(seg))) {
            			ret = -EFAULT;
           -			goto out;
-          -		}
-          -
-          -		ret = gntdev_grant_copy_seg(&batch, &seg, &copy.segments[i].status);
           +			goto out_put_pages;
-          +		}
-          +
+           		}
+           
+          -		ret = gntdev_grant_copy_seg(&batch, &seg, &copy.segments[i].status);
           +		ret = gntdev_grant_copy_seg(batch, &seg, &copy.segments[i].status);
            		if (ret < 0)
           -			goto out;
@@ -863,13 +866,12 @@ jobs:
           -	if (batch.nr_ops)
           -		ret = gntdev_copy(&batch);
           -	return ret;
-          -
-          -  out:
-          -	gntdev_put_pages(&batch);
           +	if (batch->nr_ops)
           +		ret = gntdev_copy(batch);
           +	goto out_free;
-          +
+           
+          -  out:
+          -	gntdev_put_pages(&batch);
           +out_put_pages:
           +	gntdev_put_pages(batch);
           +out_free:
@@ -878,9 +880,10 @@ jobs:
            }
            
           diff --git a/fs/bcachefs/checksum.c b/fs/bcachefs/checksum.c
+          index 088fd2e7b..5db63634c 100644
           --- a/fs/bcachefs/checksum.c
           +++ b/fs/bcachefs/checksum.c
-          @@ -324,7 +324,7 @@
+          @@ -324,7 +324,7 @@ int __bch2_encrypt_bio(struct bch_fs *c, unsigned type,
            {
            	struct bio_vec bv;
            	struct bvec_iter iter;
@@ -889,17 +892,18 @@ jobs:
            	size_t bytes = 0;
            	int ret = 0;
            
-          @@ -351,6 +351,9 @@
-           		sg_set_page(sg++, bv.bv_page, bv.bv_len, bv.bv_offset);
+          @@ -352,6 +352,9 @@ int __bch2_encrypt_bio(struct bch_fs *c, unsigned type,
            		bytes += bv.bv_len;
            	}
-          +
+           
           +	if (!bytes)
           +		return 0;
-           
+          +
            	sg_mark_end(sg - 1);
            	return do_encrypt_sg(c->chacha20, nonce, sgl, bytes);
+           }
           diff --git a/fs/bcachefs/fsck.c b/fs/bcachefs/fsck.c
+          index 8e2010212..8419320ef 100644
           --- a/fs/bcachefs/fsck.c
           +++ b/fs/bcachefs/fsck.c
           @@ -19,6 +19,7 @@
@@ -910,7 +914,7 @@ jobs:
            
            /*
             * XXX: this is handling transaction restarts without returning
-          @@ -288,13 +289,18 @@
+          @@ -288,13 +289,18 @@ static int reattach_inode(struct btree_trans *trans,
            			  u32 inode_snapshot)
            {
            	struct bch_hash_info dir_hash;
@@ -930,7 +934,7 @@ jobs:
            	if (inode->bi_subvol) {
            		inode->bi_parent_subvol = BCACHEFS_ROOT_SUBVOL;
            
-          @@ -309,24 +315,24 @@
+          @@ -309,24 +315,24 @@ static int reattach_inode(struct btree_trans *trans,
            		snprintf(name_buf, sizeof(name_buf), "%llu", inode->bi_inum);
            	}
            
@@ -941,10 +945,9 @@ jobs:
            
            	if (S_ISDIR(inode->bi_mode)) {
           -		lostfound.bi_nlink++;
-          -
-          -		ret = __bch2_fsck_write_inode(trans, &lostfound, U32_MAX);
           +		lostfound->bi_nlink++;
-          +
+           
+          -		ret = __bch2_fsck_write_inode(trans, &lostfound, U32_MAX);
           +		ret = __bch2_fsck_write_inode(trans, lostfound, U32_MAX);
            		if (ret)
            			return ret;
@@ -961,7 +964,7 @@ jobs:
            				dirent_snapshot,
            				&dir_hash,
            				inode_d_type(inode),
-          @@ -337,7 +343,7 @@
+          @@ -337,7 +343,7 @@ static int reattach_inode(struct btree_trans *trans,
            	if (ret)
            		return ret;
            
@@ -970,7 +973,7 @@ jobs:
            	inode->bi_dir_offset	= dir_offset;
            
            	return __bch2_fsck_write_inode(trans, inode, inode_snapshot);
-          @@ -2175,32 +2181,46 @@
+          @@ -2175,32 +2181,46 @@ static int check_dirent(struct btree_trans *trans, struct btree_iter *iter,
            	return ret;
            }
            
@@ -991,17 +994,15 @@ jobs:
           -	struct inode_walker target = inode_walker_init();
           -	struct snapshots_seen s;
           -	struct bch_hash_info hash_info;
-          -
-          -	snapshots_seen_init(&s);
-          -
-          -	int ret = bch2_trans_run(c,
           +	struct bch2_check_dirents_state *state;
           +	int ret;
-          +
+           
+          -	snapshots_seen_init(&s);
           +	state = kzalloc(sizeof(*state), GFP_KERNEL);
           +	if (!state)
           +		return -ENOMEM;
-          +
+           
+          -	int ret = bch2_trans_run(c,
           +	state->dir = inode_walker_init();
           +	state->target = inode_walker_init();
           +	snapshots_seen_init(&state->snapshots);
@@ -1032,23 +1033,25 @@ jobs:
            	return ret;
            }
           diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+          index 526793c38..9e998d6ed 100644
           --- a/fs/f2fs/data.c
           +++ b/fs/f2fs/data.c
-          @@ -3239,9 +3239,10 @@
-           	return false;
-           }
-           
-          -static int __f2fs_write_data_pages(struct address_space *mapping,
-          -						struct writeback_control *wbc,
-          -						enum iostat_type io_type)
+          @@ -2933,9 +2933,10 @@ static int f2fs_write_data_page(struct page *page,
+            * The major change is making write step of cold data page separately from
+            * warm/hot data page.
+            */
+          -static int f2fs_write_cache_pages(struct address_space *mapping,
+          -					struct writeback_control *wbc,
+          -					enum iostat_type io_type)
           +static noinline_for_stack int
-          +__f2fs_write_data_pages(struct address_space *mapping,
-          +			struct writeback_control *wbc,
-          +			enum iostat_type io_type)
+          +f2fs_write_cache_pages(struct address_space *mapping,
+          +		       struct writeback_control *wbc,
+          +		       enum iostat_type io_type)
            {
-           	struct inode *inode = mapping->host;
-           	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+           	int ret = 0;
+           	int done = 0, retry = 0;
           diff --git a/include/linux/poll.h b/include/linux/poll.h
+          index d1ea4f371..3d618d24d 100644
           --- a/include/linux/poll.h
           +++ b/include/linux/poll.h
           @@ -17,7 +17,8 @@
@@ -1062,9 +1065,10 @@ jobs:
            #define N_INLINE_POLL_ENTRIES	(WQUEUES_STACK_ALLOC / sizeof(struct poll_table_entry))
            
           diff --git a/lib/maple_tree.c b/lib/maple_tree.c
+          index 2d7d27e6a..fa3c33aa8 100644
           --- a/lib/maple_tree.c
           +++ b/lib/maple_tree.c
-          @@ -4148,7 +4148,7 @@
+          @@ -4148,7 +4148,7 @@ static inline bool mas_wr_append(struct ma_wr_state *wr_mas,
             *
             * This is where split, rebalance end up.
             */
@@ -1074,9 +1078,10 @@ jobs:
            	struct maple_big_node b_node;
            
           diff --git a/lib/zstd/common/entropy_common.c b/lib/zstd/common/entropy_common.c
+          index fef67056f..b6fc403a8 100644
           --- a/lib/zstd/common/entropy_common.c
           +++ b/lib/zstd/common/entropy_common.c
-          @@ -248,6 +248,7 @@
+          @@ -248,6 +248,7 @@ size_t FSE_readNCount(
                @return : size read from `src` , or an error Code .
                Note : Needed by HUF_readCTable() and HUF_readDTableX?() .
            */
@@ -1085,9 +1090,10 @@ jobs:
                                 U32* nbSymbolsPtr, U32* tableLogPtr,
                                 const void* src, size_t srcSize)
           diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+          index 61ed3e549..86febf8fd 100644
           --- a/net/ipv4/tcp_bbr.c
           +++ b/net/ipv4/tcp_bbr.c
-          @@ -1077,9 +1077,7 @@
+          @@ -1077,9 +1077,7 @@ static int bbr_update_ecn_alpha(struct sock *sk)
            
            	/* See if we should use ECN sender logic for this connection. */
            	if (!bbr->ecn_eligible && bbr_can_use_ecn(sk) &&
@@ -1098,7 +1104,7 @@ jobs:
            		bbr->ecn_eligible = 1;
            
            	/* Skip updating alpha only if not ECN-eligible and PLB is disabled. */
-          @@ -1184,7 +1182,7 @@
+          @@ -1184,7 +1182,7 @@ static bool bbr_is_inflight_too_high(const struct sock *sk,
            	}
            
            	if (rs->delivered_ce > 0 && rs->delivered > 0 &&
@@ -1107,7 +1113,7 @@ jobs:
            		ecn_thresh = (u64)rs->delivered * bbr_param(sk, ecn_thresh) >>
            				BBR_SCALE;
            		if (rs->delivered_ce > ecn_thresh) {
-          @@ -1382,7 +1380,7 @@
+          @@ -1382,7 +1380,7 @@ static void bbr_adapt_lower_bounds(struct sock *sk,
            		return;
            
            	/* ECN response. */
@@ -1117,9 +1123,10 @@ jobs:
            		bbr_ecn_lower_bounds(sk, &ecn_inflight_lo);
            	}
           diff --git a/sound/pci/hda/cs35l41_hda_property.c b/sound/pci/hda/cs35l41_hda_property.c
+          index 112fc7ae8..7711b4679 100644
           --- a/sound/pci/hda/cs35l41_hda_property.c
           +++ b/sound/pci/hda/cs35l41_hda_property.c
-          @@ -429,16 +429,28 @@
+          @@ -429,16 +429,28 @@ static int lenovo_legion_no_acpi(struct cs35l41_hda *cs35l41, struct device *phy
            static int asus_rog_2023_ally_fix(struct cs35l41_hda *cs35l41, struct device *physdev, int id,
            				const char *hid)
            {
@@ -1134,10 +1141,9 @@ jobs:
           -		printk(KERN_INFO "DSD properties exist in the %d BIOS. Not applying DSD override...\n", rog_ally_bios_int);
           -		return -ENOENT; //Patch not applicable. Exiting...
           -	}
-          -
-          -	struct cs35l41_hw_cfg *hw_cfg = &cs35l41->hw_cfg;
           +	int ret;
-          +
+           
+          -	struct cs35l41_hw_cfg *hw_cfg = &cs35l41->hw_cfg;
           +	rog_ally_bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
           +	if (!rog_ally_bios_ver || strncmp(rog_ally_bios_ver, "RC71L.", 6))
           +		return -EINVAL;
@@ -1169,7 +1175,8 @@ jobs:
             drivers/net/ethernet/jme.c
           grep -q 'CFLAGS_hci_vhci.o += -fno-optimize-sibling-calls' \
             drivers/bluetooth/Makefile
-          grep -q 'static noinline_for_stack int' fs/f2fs/data.c
+          grep -A1 '^static noinline_for_stack int$' fs/f2fs/data.c | \
+            grep -q '^f2fs_write_cache_pages(struct address_space \*mapping,'
           grep -q 'static noinline_for_stack void mas_wr_bnode' lib/maple_tree.c
           grep -q '^noinline$' lib/zstd/common/entropy_common.c
           grep -q '#define POLL_STACK_ALLOC[[:space:]]*128' include/linux/poll.h
@@ -1666,7 +1673,7 @@ jobs:
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
           KernelSU compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
-          Zenith warning cleanup: source/codegen fixes plus a targeted objtool annotation for all 25 diagnostics observed in the successful baseline build
+          Zenith warning cleanup: source/codegen fixes for all baseline diagnostics, including the Full-LTO F2FS caller-frame expansion
           Warning policy: zero compiler, linker, objtool, modpost, or module-install warning diagnostics permitted
           x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
           Kernel release: $KERNEL_RELEASE
