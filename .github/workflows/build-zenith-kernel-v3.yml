@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V10
+name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V11
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-28-v10-bcachefs-checkpatch-clean"
+      WORKFLOW_REVISION: "2026-07-28-v11-f2fs-scoped-verification"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "Running workflow revision: $WORKFLOW_REVISION"
-          echo "Expected fixed verification: F2FS context off stack and bcachefs patch checkpatch-clean"
+          echo "Expected fixed verification: scoped F2FS stack-allocation check and warning-clean patches"
 
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -1358,10 +1358,21 @@ jobs:
           grep -Fq 'struct compress_ctx *cc = NULL;' fs/f2fs/data.c
           grep -Fq 'cc = f2fs_kzalloc(sbi, sizeof(*cc), GFP_NOFS | __GFP_NOFAIL);' \
             fs/f2fs/data.c
-          if grep -Fq 'struct compress_ctx cc = ' fs/f2fs/data.c; then
-            echo "F2FS compress_ctx is still stack allocated" >&2
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("fs/f2fs/data.c").read_text()
+          start = source.index("f2fs_write_cache_pages(")
+          end = source.index("\nstatic inline bool __should_serialize_io", start)
+          function = source[start:end]
+
+          if "struct compress_ctx *cc = NULL;" not in function:
+              raise SystemExit("Heap-backed compress_ctx declaration missing from f2fs_write_cache_pages")
+          if "struct compress_ctx cc = {" in function:
+              raise SystemExit("f2fs_write_cache_pages still stack-allocates compress_ctx")
+
+          print("Scoped F2FS compress_ctx verification passed")
+          PY
 
           "$KERNEL_DIR/scripts/checkpatch.pl" --no-tree --strict \
             "$RUNNER_TEMP/f2fs-compress-ctx-stack-v9.patch" \
