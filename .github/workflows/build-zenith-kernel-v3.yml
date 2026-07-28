@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V12
+name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V13
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-28-v12-arvox-ax900-aic8800d80"
+      WORKFLOW_REVISION: "2026-07-28-v13-arvox-aic8800d80-warning-clean"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -246,6 +246,169 @@ jobs:
           grep -Fq 'aic8800_fdrv/' "$AIC_DIR/drivers/aic8800/Makefile"
 
           git -C "$AIC_DIR" log -1 --oneline
+
+      - name: Apply audited AIC8800D80 warning and safety fixes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$AIC_DIR"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def load(rel: str) -> tuple[Path, str]:
+              path = Path(rel)
+              return path, path.read_text()
+
+          def replace_once(rel: str, old: str, new: str, label: str) -> None:
+              path, text = load(rel)
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"{label}: expected exactly one match in {rel}, found {count}"
+                  )
+              path.write_text(text.replace(old, new, 1))
+
+          # Respect the parent Kbuild jobserver. The vendor Makefile forcibly
+          # overwrote -j and emitted two GNU make jobserver warnings per build.
+          replace_once(
+              "drivers/aic8800/Makefile",
+              "MAKEFLAGS +=-j$(shell nproc)\n",
+              "# Parallelism is inherited from the parent Kbuild invocation.\n",
+              "remove nested MAKEFLAGS override",
+          )
+
+          # The CRC seed is a 32-bit all-ones value. Use an unsigned-int
+          # expression so Clang does not truncate a 64-bit unsigned long.
+          replace_once(
+              "drivers/aic8800/aic_load_fw/aicbluetooth.c",
+              "    u32 crc = ~0UL;\n",
+              "    u32 crc = ~0U;\n",
+              "fix CRC seed conversion",
+          )
+
+          # Dormant patch-table code is intentionally retained under #if 0.
+          # Mark its helper and state as optional instead of deleting it.
+          replace_once(
+              "drivers/aic8800/aic_load_fw/aic_compat_8800d80.c",
+              "static int aicbt_ext_patch_data_load(",
+              "static int __maybe_unused aicbt_ext_patch_data_load(",
+              "mark dormant patch helper unused",
+          )
+          replace_once(
+              "drivers/aic8800/aic_load_fw/aic_compat_8800d80.c",
+              "    struct aicbt_patch_table *head = NULL;\n",
+              "    struct aicbt_patch_table *head __maybe_unused = NULL;\n",
+              "mark dormant patch table unused",
+          )
+          replace_once(
+              "drivers/aic8800/aic_load_fw/aic_compat_8800d80.c",
+              "    struct aicbt_patch_info_t patch_info = {\n",
+              "    struct aicbt_patch_info_t patch_info __maybe_unused = {\n",
+              "mark dormant patch info unused",
+          )
+
+          # Normalize the allocation failure guard inside only the mesh-path
+          # update function. Some vendor snapshots omit braces and indent the
+          # following assignment as though it were guarded.
+          rel = "drivers/aic8800/aic8800_fdrv/rwnx_msg_tx.c"
+          path, text = load(rel)
+          start = text.find("int rwnx_send_mesh_path_update_req(")
+          end = text.find("\nvoid rwnx_send_mesh_proxy_add_req", start)
+          if start < 0 or end < 0:
+              raise SystemExit(f"cannot locate mesh path update function in {rel}")
+          block = text[start:end]
+          if "if (!req) {" not in block:
+              block_new, count = re.subn(
+                  r"(?m)^([ \t]*)if \(!req\)[ \t]*\n[ \t]*return -ENOMEM;",
+                  lambda m: (
+                      f"{m.group(1)}if (!req) {{\n"
+                      f"{m.group(1)}    return -ENOMEM;\n"
+                      f"{m.group(1)}}}"
+                  ),
+                  block,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit(
+                      f"cannot normalize allocation guard in {rel}"
+                  )
+              text = text[:start] + block_new + text[end:]
+              path.write_text(text)
+
+          # The allocator ignores its input pointer. Initialize it explicitly
+          # so the call does not consume an indeterminate value.
+          replace_once(
+              "drivers/aic8800/aic8800_fdrv/rwnx_tx.c",
+              "    struct msg_buf *msgbuf;\n",
+              "    struct msg_buf *msgbuf = NULL;\n",
+              "initialize TCP ACK message pointer",
+          )
+
+          # RF-test power metadata must be deterministic even when a vendor
+          # command supplies a mode outside the explicitly handled set.
+          replace_once(
+              "drivers/aic8800/aic8800_fdrv/aic_priv_cmd.c",
+              "\tu8_l lvl_band, lvl_mod, lvl_idx, lvl_pwr = 0;\n",
+              "\tu8_l lvl_band = 0, lvl_mod = 0, lvl_idx = 0, lvl_pwr = 0;\n",
+              "initialize RF-test level fields",
+          )
+
+          # Always default to the original transfer buffer. If the optional
+          # aligned allocation fails, the URB no longer receives an
+          # indeterminate pointer.
+          replace_once(
+              "drivers/aic8800/aic8800_fdrv/aicwf_usb.c",
+              "#else\n    if (!IS_ALIGNED((unsigned long)buf, align_param)) {\n",
+              "#else\n    buf_align = buf;\n    if (!IS_ALIGNED((unsigned long)buf, align_param)) {\n",
+              "initialize aligned USB transfer pointer",
+          )
+
+          # Post-patch structural assertions protect this workflow from a
+          # silently changed upstream snapshot.
+          checks = {
+              "drivers/aic8800/Makefile": [
+                  "# Parallelism is inherited from the parent Kbuild invocation.",
+              ],
+              "drivers/aic8800/aic_load_fw/aicbluetooth.c": [
+                  "u32 crc = ~0U;",
+              ],
+              "drivers/aic8800/aic_load_fw/aic_compat_8800d80.c": [
+                  "static int __maybe_unused aicbt_ext_patch_data_load(",
+                  "head __maybe_unused = NULL;",
+                  "patch_info __maybe_unused = {",
+              ],
+              "drivers/aic8800/aic8800_fdrv/rwnx_msg_tx.c": [
+                  "if (!req) {",
+              ],
+              "drivers/aic8800/aic8800_fdrv/rwnx_tx.c": [
+                  "struct msg_buf *msgbuf = NULL;",
+              ],
+              "drivers/aic8800/aic8800_fdrv/aic_priv_cmd.c": [
+                  "lvl_band = 0, lvl_mod = 0, lvl_idx = 0, lvl_pwr = 0;",
+              ],
+              "drivers/aic8800/aic8800_fdrv/aicwf_usb.c": [
+                  "buf_align = buf;",
+              ],
+          }
+          for rel, needles in checks.items():
+              body = Path(rel).read_text()
+              for needle in needles:
+                  if needle not in body:
+                      raise SystemExit(f"post-patch check failed: {rel}: {needle}")
+          PY
+
+          git diff --check
+          git diff --stat
+          git diff -- \
+            drivers/aic8800/Makefile \
+            drivers/aic8800/aic_load_fw/aicbluetooth.c \
+            drivers/aic8800/aic_load_fw/aic_compat_8800d80.c \
+            drivers/aic8800/aic8800_fdrv/rwnx_msg_tx.c \
+            drivers/aic8800/aic8800_fdrv/rwnx_tx.c \
+            drivers/aic8800/aic8800_fdrv/aic_priv_cmd.c \
+            drivers/aic8800/aic8800_fdrv/aicwf_usb.c
 
       - name: Apply audited KernelSU compatibility patch
         shell: bash
@@ -1713,7 +1876,7 @@ jobs:
           fi
 
           grep -nEi \
-            '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:' \
+            '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^make(\[[0-9]+\])?: warning:|^warning:' \
             "$LOG_DIR/warning-cleanup-preflight.log" \
             > "$LOG_DIR/warning-cleanup-preflight-warnings.txt" || true
           if [ -s "$LOG_DIR/warning-cleanup-preflight-warnings.txt" ]; then
@@ -1873,7 +2036,7 @@ jobs:
           modinfo -F alias "$AIC_LOAD_FW" | grep -Eqi 'usb:vA69Cp8D80'
           modinfo -F alias "$AIC_FDRV" | grep -Eqi 'usb:vA69Cp(8D81|8801)'
 
-          grep -nEi             '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:'             "$LOG_DIR/arvox-module-build.log"             > "$LOG_DIR/arvox-module-warnings.txt" || true
+          grep -nEi             '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^make(\[[0-9]+\])?: warning:|^warning:'             "$LOG_DIR/arvox-module-build.log"             > "$LOG_DIR/arvox-module-warnings.txt" || true
           if [ -s "$LOG_DIR/arvox-module-warnings.txt" ]; then
             echo "Arvox AIC8800D80 module build emitted warnings:" >&2
             cat "$LOG_DIR/arvox-module-warnings.txt" >&2
@@ -1882,7 +2045,7 @@ jobs:
 
           END="$(date +%s)"
           echo "AIC_MODULE_BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
-          echo "Arvox AX900 AIC8800D80 modules built with matching $KERNEL_RELEASE vermagic and zero warnings."
+          echo "Arvox AX900 AIC8800D80 modules built with matching $KERNEL_RELEASE vermagic and zero compiler, linker, modpost, or GNU make warnings."
           modinfo "$AIC_LOAD_FW"
           modinfo "$AIC_FDRV"
 
@@ -2006,7 +2169,7 @@ jobs:
             fi
 
             grep -nEi \
-              '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:' \
+              '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^make(\[[0-9]+\])?: warning:|^warning:' \
               "$log_path" | \
               sed "s#^#$log_name:#" >> "$LOG_DIR/all-build-warnings.txt" || true
           done
@@ -2066,6 +2229,7 @@ jobs:
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
           AIC8800D80 repository: $AIC_REPO
+          AIC warning cleanup: CRC width, mesh guard, dormant patch state, TCP ACK pointer, RF-test fields, USB alignment fallback, and Kbuild jobserver
           AIC8800D80 branch: $AIC_BRANCH
           AIC8800D80 commit (pinned): $AIC_COMMIT
           Arvox AX900 modules: source-built aic_load_fw.ko and aic8800_fdrv.ko against the exact Zenith output tree
