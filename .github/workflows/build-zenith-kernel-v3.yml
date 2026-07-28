@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V11
+name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V12
 
 on:
   workflow_dispatch:
@@ -24,15 +24,20 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-28-v11-f2fs-scoped-verification"
+      WORKFLOW_REVISION: "2026-07-28-v12-arvox-ax900-aic8800d80"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
       KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next.git
       KSU_BRANCH: dev
       KSU_COMMIT: "d6a42fd9285c11b8e8e67bfe72a5050528006c00"
+      AIC_REPO: https://github.com/shenmintao/aic8800d80.git
+      AIC_BRANCH: main
+      AIC_COMMIT: "3a0945bdcc94dd15402b8e133f5cf53b9ace7ed6"
       KERNEL_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith
       OUT_DIR: ${{ github.workspace }}/kernel-source/kernel-zenith/out
+      AIC_DIR: ${{ github.workspace }}/aic8800d80
+      ARVOX_BUNDLE_DIR: ${{ github.workspace }}/arvox-ax900-bundle
       CONFIG_FILE: ${{ github.workspace }}/kernel-configs/zenith-6.9-x86_64.config
       ARTIFACT_DIR: ${{ github.workspace }}/build-artifacts
       LOG_DIR: ${{ github.workspace }}/build-logs
@@ -44,7 +49,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "Running workflow revision: $WORKFLOW_REVISION"
-          echo "Expected fixed verification: scoped F2FS stack-allocation check and warning-clean patches"
+          echo "Expected build: warning-clean Zenith + KernelSU Next + source-built AIC8800D80 Arvox AX900 modules"
 
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -125,6 +130,20 @@ jobs:
           grep -qx 'CONFIG_KPROBES=y' "$CONFIG_FILE"
           grep -qx 'CONFIG_EXT4_FS=y' "$CONFIG_FILE"
           grep -qx 'CONFIG_OVERLAY_FS=y' "$CONFIG_FILE"
+
+          # Arvox AX900 uses an AIC8800D80 USB FullMAC device. The vendor tar's
+          # cfg80211/mac80211/Bluetooth prebuilts were built for Linux 6.18 and
+          # must never be mixed with this Linux 6.9.9 kernel. Build and use the
+          # matching in-tree dependencies from this config instead.
+          grep -qx 'CONFIG_WIRELESS=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_CFG80211=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_MAC80211=m' "$CONFIG_FILE"
+          grep -Eq '^CONFIG_RFKILL=(y|m)$' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT_HCIBTUSB=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_USB=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_FW_LOADER=y' "$CONFIG_FILE"
+          grep -qx 'CONFIG_MODVERSIONS=y' "$CONFIG_FILE"
           sha256sum "$CONFIG_FILE"
 
       - name: Clone pinned Zenith kernel revision
@@ -201,6 +220,32 @@ jobs:
             KernelSU-Next/kernel/hook/x86_64/syscall_hook.c
 
           git -C KernelSU-Next log -1 --oneline
+
+      - name: Clone pinned AIC8800D80 source for Arvox AX900
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$AIC_DIR"
+
+          git init "$AIC_DIR"
+          git -C "$AIC_DIR" remote add origin "$AIC_REPO"
+          git -C "$AIC_DIR" fetch --depth 1 origin "$AIC_COMMIT"
+          git -C "$AIC_DIR" checkout --detach FETCH_HEAD
+
+          test "$(git -C "$AIC_DIR" rev-parse HEAD)" = "$AIC_COMMIT"
+          test -f "$AIC_DIR/drivers/aic8800/Makefile"
+          test -f "$AIC_DIR/drivers/aic8800/aic_load_fw/Makefile"
+          test -f "$AIC_DIR/drivers/aic8800/aic8800_fdrv/Makefile"
+          test -d "$AIC_DIR/fw/aic8800D80"
+
+          # The Arvox vendor package identifies the first-stage USB loader as
+          # a69c:8d80. Refuse an AIC source snapshot that does not contain D80
+          # support or the two required source-built modules.
+          grep -RqiE '8[dD]80|AIC8800D80'             "$AIC_DIR/drivers/aic8800/aic_load_fw"             "$AIC_DIR/drivers/aic8800/aic8800_fdrv"
+          grep -Fq 'aic_load_fw/' "$AIC_DIR/drivers/aic8800/Makefile"
+          grep -Fq 'aic8800_fdrv/' "$AIC_DIR/drivers/aic8800/Makefile"
+
+          git -C "$AIC_DIR" log -1 --oneline
 
       - name: Apply audited KernelSU compatibility patch
         shell: bash
@@ -1464,20 +1509,37 @@ jobs:
             --enable KPROBE_EVENTS \
             --enable EXT4_FS \
             --enable OVERLAY_FS \
+            --enable WIRELESS \
+            --module CFG80211 \
+            --enable CFG80211_WEXT \
+            --module MAC80211 \
+            --module BT \
+            --module BT_HCIBTUSB \
+            --enable USB \
+            --enable FW_LOADER \
             --enable KSU \
             --enable KSU_X86_PATCH_SYSCALL_DISPATCHER
 
           make O="$OUT_DIR" ARCH=x86_64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-          for option in X86_64 MODULES KPROBES EXT4_FS OVERLAY_FS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER; do
+          for option in X86_64 MODULES KPROBES EXT4_FS OVERLAY_FS WIRELESS USB FW_LOADER KSU KSU_X86_PATCH_SYSCALL_DISPATCHER; do
             grep -qx "CONFIG_${option}=y" "$OUT_DIR/.config" || {
               echo "CONFIG_${option}=y is missing after olddefconfig" >&2
               exit 1
             }
           done
 
+          for option in CFG80211 MAC80211 BT BT_HCIBTUSB; do
+            grep -qx "CONFIG_${option}=m" "$OUT_DIR/.config" || {
+              echo "CONFIG_${option}=m is missing after olddefconfig" >&2
+              exit 1
+            }
+          done
+
+          grep -Eq '^CONFIG_RFKILL=(y|m)$' "$OUT_DIR/.config"
+
           echo "=== Final key config options ==="
-          grep -E '^CONFIG_(X86_64|MODULES|KSU|KSU_X86_PATCH_SYSCALL_DISPATCHER|KPROBES|KPROBES_ON_FTRACE|KPROBE_EVENTS|EXT4_FS|OVERLAY_FS|LTO_CLANG_FULL)=' "$OUT_DIR/.config"
+          grep -E '^CONFIG_(X86_64|MODULES|KSU|KSU_X86_PATCH_SYSCALL_DISPATCHER|KPROBES|KPROBES_ON_FTRACE|KPROBE_EVENTS|EXT4_FS|OVERLAY_FS|WIRELESS|CFG80211|MAC80211|RFKILL|BT|BT_HCIBTUSB|USB|FW_LOADER|MODVERSIONS|LTO_CLANG_FULL)=' "$OUT_DIR/.config"
 
       - name: Generate SELinux headers required by KernelSU
         shell: bash
@@ -1686,8 +1748,8 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          rm -rf "$ARTIFACT_DIR" "$MODULES_DIR"
-          mkdir -p "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR"
+          rm -rf "$ARTIFACT_DIR" "$MODULES_DIR" "$ARVOX_BUNDLE_DIR"
+          mkdir -p "$ARTIFACT_DIR" "$LOG_DIR" "$MODULES_DIR" "$ARVOX_BUNDLE_DIR"
           rm -f "$OUT_DIR/arch/x86/boot/bzImage" "$OUT_DIR/vmlinux" "$OUT_DIR/System.map"
 
           BUILD_MARKER="$GITHUB_WORKSPACE/.build-start"
@@ -1759,28 +1821,164 @@ jobs:
             echo "- bzImage SHA-256: \`$(sha256sum "$BZIMAGE" | awk '{print $1}')\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install and package modules
+      - name: Build and verify Arvox AX900 AIC8800D80 modules
+        id: arvox
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          mkdir -p "$LOG_DIR"
+
+          AIC_KBUILD_DIR="$AIC_DIR/drivers/aic8800"
+          test -d "$AIC_KBUILD_DIR"
+          test -s "$OUT_DIR/Module.symvers"
+          test -s "$OUT_DIR/include/config/auto.conf"
+
+          START="$(date +%s)"
+          set +e
+          make             --output-sync=target             O="$OUT_DIR"             ARCH=x86_64             LLVM=1             LLVM_IAS=1             M="$AIC_KBUILD_DIR"             -j2             modules             2>&1 | tee "$LOG_DIR/arvox-module-build.log"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo
+            echo "========== ARVOX AIC8800D80 BUILD ERRORS =========="
+            grep -nEi -B8 -A20               '^[^[:space:]].*:[0-9]+:[0-9]+: (fatal )?error:|^ld\.lld: error:|^clang: error:|undefined reference|modpost:.*undefined|LLVM ERROR|internal compiler error'               "$LOG_DIR/arvox-module-build.log" | head -n 500 || true
+            echo
+            echo "========== FINAL 300 ARVOX BUILD LINES =========="
+            tail -n 300 "$LOG_DIR/arvox-module-build.log" || true
+            exit "$STATUS"
+          fi
+
+          AIC_LOAD_FW="$AIC_KBUILD_DIR/aic_load_fw/aic_load_fw.ko"
+          AIC_FDRV="$AIC_KBUILD_DIR/aic8800_fdrv/aic8800_fdrv.ko"
+          test -s "$AIC_LOAD_FW"
+          test -s "$AIC_FDRV"
+
+          file "$AIC_LOAD_FW" | grep -q 'ELF 64-bit LSB relocatable, x86-64'
+          file "$AIC_FDRV" | grep -q 'ELF 64-bit LSB relocatable, x86-64'
+
+          for module in "$AIC_LOAD_FW" "$AIC_FDRV"; do
+            vermagic="$(modinfo -F vermagic "$module")"
+            case "$vermagic" in
+              "$KERNEL_RELEASE "*) ;;
+              *)
+                echo "Arvox module vermagic mismatch: $module -> $vermagic" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          modinfo -F depends "$AIC_FDRV" | grep -Eq '(^|,)aic_load_fw(,|$)'
+          modinfo -F alias "$AIC_LOAD_FW" | grep -Eqi 'usb:vA69Cp8D80'
+          modinfo -F alias "$AIC_FDRV" | grep -Eqi 'usb:vA69Cp(8D81|8801)'
+
+          grep -nEi             '(^|[[:space:]])[^[:space:]]+:[0-9]+(:[0-9]+)?: warning:|^ld\.lld[^:]*: warning:|^[^[:space:]].*\.o: warning: objtool:|^WARNING: modpost:|^warning:'             "$LOG_DIR/arvox-module-build.log"             > "$LOG_DIR/arvox-module-warnings.txt" || true
+          if [ -s "$LOG_DIR/arvox-module-warnings.txt" ]; then
+            echo "Arvox AIC8800D80 module build emitted warnings:" >&2
+            cat "$LOG_DIR/arvox-module-warnings.txt" >&2
+            exit 1
+          fi
+
+          END="$(date +%s)"
+          echo "AIC_MODULE_BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          echo "Arvox AX900 AIC8800D80 modules built with matching $KERNEL_RELEASE vermagic and zero warnings."
+          modinfo "$AIC_LOAD_FW"
+          modinfo "$AIC_FDRV"
+
+      - name: Install and package kernel plus Arvox modules
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          make \
-            O="$OUT_DIR" \
-            ARCH=x86_64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            INSTALL_MOD_PATH="$MODULES_DIR" \
-            INSTALL_MOD_STRIP=1 \
-            modules_install \
-            2>&1 | tee "$LOG_DIR/modules-install.log"
+          make             O="$OUT_DIR"             ARCH=x86_64             LLVM=1             LLVM_IAS=1             INSTALL_MOD_PATH="$MODULES_DIR"             INSTALL_MOD_STRIP=1             modules_install             2>&1 | tee "$LOG_DIR/modules-install.log"
 
-          rm -f \
-            "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/build" \
-            "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/source"
+          AIC_KBUILD_DIR="$AIC_DIR/drivers/aic8800"
+          make             O="$OUT_DIR"             ARCH=x86_64             LLVM=1             LLVM_IAS=1             M="$AIC_KBUILD_DIR"             INSTALL_MOD_PATH="$MODULES_DIR"             INSTALL_MOD_DIR="updates/arvox-ax900"             INSTALL_MOD_STRIP=1             modules_install             2>&1 | tee -a "$LOG_DIR/modules-install.log"
+
+          rm -f             "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/build"             "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/source"
+
+          # The supplied vendor prebuilts are intentionally not reused: their
+          # vermagic is 6.18.x and CONFIG_MODVERSIONS makes them ABI-incompatible
+          # with 6.9.9-zenith. Package source-built AIC modules and matching
+          # Zenith cfg80211/Bluetooth modules instead.
+          AIC_INSTALL_ROOT="$MODULES_DIR/lib/modules/$KERNEL_RELEASE/updates/arvox-ax900"
+          test -s "$AIC_INSTALL_ROOT/aic_load_fw.ko"
+          test -s "$AIC_INSTALL_ROOT/aic8800_fdrv.ko"
+
+          FIRMWARE_DST="$MODULES_DIR/lib/firmware/aic8800D80"
+          mkdir -p "$FIRMWARE_DST"
+          rsync -a --delete "$AIC_DIR/fw/aic8800D80/" "$FIRMWARE_DST/"
+
+          for firmware in             fmacfw_8800d80_u02.bin             fw_patch_8800d80_u02.bin             fw_patch_table_8800d80_u02.bin             fw_adid_8800d80_u02.bin; do
+            test -s "$FIRMWARE_DST/$firmware"
+          done
+
+          cat > "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.load.arvox-ax900" <<'EOF'
+          cfg80211
+          aic_load_fw
+          aic8800_fdrv
+          bluetooth
+          btintel
+          btbcm
+          btrtl
+          btusb
+          EOF
+
+          depmod -b "$MODULES_DIR" -F "$OUT_DIR/System.map" "$KERNEL_RELEASE"             2>&1 | tee -a "$LOG_DIR/modules-install.log"
+
+          grep -Fq 'aic_load_fw.ko' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.dep"
+          grep -Fq 'aic8800_fdrv.ko' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.dep"
+          grep -Eqi 'a69c.*8d80' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.alias"
+
+          # Make a focused Android/vendor integration bundle in addition to the
+          # complete module archive.
+          rm -rf "$ARVOX_BUNDLE_DIR"
+          mkdir -p             "$ARVOX_BUNDLE_DIR/modules"             "$ARVOX_BUNDLE_DIR/firmware/aic8800D80"             "$ARVOX_BUNDLE_DIR/android"
+
+          for module_name in             cfg80211 mac80211 bluetooth btintel btbcm btrtl btusb             aic_load_fw aic8800_fdrv; do
+            module_path="$(find "$MODULES_DIR/lib/modules/$KERNEL_RELEASE"               -type f -name "${module_name}.ko" -print -quit)"
+            test -n "$module_path"
+            cp "$module_path" "$ARVOX_BUNDLE_DIR/modules/"
+          done
+
+          cp -a "$FIRMWARE_DST/." "$ARVOX_BUNDLE_DIR/firmware/aic8800D80/"
+          cp "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.load.arvox-ax900"             "$ARVOX_BUNDLE_DIR/modules.load.arvox-ax900"
+
+          cat > "$ARVOX_BUNDLE_DIR/android/init.arvox.rc" <<'EOF'
+          # Arvox AX900 / AIC8800D80 module order for Android vendor integration.
+          # Adapt paths to the partition used by your product.
+          on property:sys.boot_completed=1
+              insmod /vendor/lib/modules/cfg80211.ko
+              insmod /vendor/lib/modules/aic_load_fw.ko
+              insmod /vendor/lib/modules/aic8800_fdrv.ko
+              insmod /vendor/lib/modules/bluetooth.ko
+              insmod /vendor/lib/modules/btintel.ko
+              insmod /vendor/lib/modules/btbcm.ko
+              insmod /vendor/lib/modules/btrtl.ko
+              insmod /vendor/lib/modules/btusb.ko
+          EOF
+
+          cat > "$ARVOX_BUNDLE_DIR/README.txt" <<EOF
+          Arvox AX900 (AIC8800D80) support bundle
+          =======================================
+          Kernel release: $KERNEL_RELEASE
+          AIC source repository: $AIC_REPO
+          AIC source commit: $AIC_COMMIT
+
+          Use these source-built modules only with this exact kernel release.
+          Do not copy the 6.18.x .ko files from arvox_vendor_setup.tar into this
+          kernel: their vermagic and symbol CRCs do not match 6.9.9-zenith.
+
+          Firmware destination on Linux: /lib/firmware/aic8800D80/
+          Recommended load order is in modules.load.arvox-ax900.
+          The normal Linux path is: modprobe aic8800_fdrv; dependencies are then
+          resolved by modules.dep. Bluetooth uses the kernel's standard btusb.
+          EOF
 
           tar --zstd -cf "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst" -C "$MODULES_DIR" .
-
+          tar --zstd -cf "$ARTIFACT_DIR/arvox-ax900-${KERNEL_RELEASE}.tar.zst" -C "$ARVOX_BUNDLE_DIR" .
 
       - name: Enforce zero-warning build gate
         shell: bash
@@ -1795,6 +1993,7 @@ jobs:
             kernelsu-preflight.log \
             warning-cleanup-preflight.log \
             kernel-build.log \
+            arvox-module-build.log \
             modules-install.log; do
             log_path="$LOG_DIR/$log_name"
             [ -f "$log_path" ] || continue
@@ -1854,6 +2053,9 @@ jobs:
           if [ -s "$LOG_DIR/kernel-warnings.txt" ]; then
             cp "$LOG_DIR/kernel-warnings.txt" "$ARTIFACT_DIR/kernel-warnings-${KERNEL_RELEASE}.txt"
           fi
+          if [ -s "$LOG_DIR/arvox-module-build.log" ]; then
+            zstd -T0 -19 "$LOG_DIR/arvox-module-build.log"               -o "$ARTIFACT_DIR/arvox-module-build-${KERNEL_RELEASE}.log.zst"
+          fi
           zstd -T0 -19 "$LOG_DIR/modules-install.log" -o "$ARTIFACT_DIR/modules-install-${KERNEL_RELEASE}.log.zst"
 
           cat > "$ARTIFACT_DIR/source-info.txt" <<EOF
@@ -1863,12 +2065,19 @@ jobs:
           KernelSU Next repository: $KSU_REPO
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
+          AIC8800D80 repository: $AIC_REPO
+          AIC8800D80 branch: $AIC_BRANCH
+          AIC8800D80 commit (pinned): $AIC_COMMIT
+          Arvox AX900 modules: source-built aic_load_fw.ko and aic8800_fdrv.ko against the exact Zenith output tree
+          Arvox firmware: fw/aic8800D80 packaged under lib/firmware/aic8800D80
+          Vendor prebuilt policy: rejected because supplied .ko vermagic is Linux 6.18.x, not 6.9.9-zenith
           KernelSU compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
           Zenith warning cleanup: source/codegen fixes for all baseline diagnostics, including the Full-LTO F2FS caller-frame expansion
           Warning policy: zero compiler, linker, objtool, modpost, or module-install warning diagnostics permitted
           x86_64 runtime dispatcher fix: CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y
           Kernel release: $KERNEL_RELEASE
           Build duration seconds: $BUILD_SECONDS
+          AIC module build duration seconds: $AIC_MODULE_BUILD_SECONDS
           Compiled object files: $OBJECT_COUNT
           Compiler/linker warnings: $WARNING_COUNT
           EOF
@@ -1880,6 +2089,7 @@ jobs:
               "config-${KERNEL_RELEASE}" \
               "System.map-${KERNEL_RELEASE}" \
               "modules-${KERNEL_RELEASE}.tar.zst" \
+              "arvox-ax900-${KERNEL_RELEASE}.tar.zst" \
               > SHA256SUMS
           )
 
