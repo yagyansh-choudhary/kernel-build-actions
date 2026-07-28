@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V8 Fixed
+name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V9
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-28-v8-fixed-f2fs-write-cache-pages"
+      WORKFLOW_REVISION: "2026-07-28-v9-f2fs-compress-ctx-heap"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euxo pipefail
           echo "Running workflow revision: $WORKFLOW_REVISION"
-          echo "Expected fixed verification: source \"drivers/kernelsu/Kconfig\""
+          echo "Expected fixed verification: F2FS compression context allocated off stack"
 
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -1194,6 +1194,189 @@ jobs:
               fi
             }
           cat "$LOG_DIR/warning-cleanup-checkpatch.log"
+
+      - name: Move F2FS compression context off stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          # Full LTO still reported a 1096-byte frame after merely preventing
+          # inlining. The 104-byte compress_ctx itself must leave the stack.
+          cat > "$RUNNER_TEMP/f2fs-compress-ctx-stack-v9.patch" <<'PATCH'
+          diff --git a/fs/f2fs/data.c b/fs/f2fs/data.c
+          index 9e998d6..2c35977 100644
+          --- a/fs/f2fs/data.c
+          +++ b/fs/f2fs/data.c
+          @@ -2948,20 +2948,7 @@ f2fs_write_cache_pages(struct address_space *mapping,
+           	sector_t last_block;
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+           	struct inode *inode = mapping->host;
+          -	struct compress_ctx cc = {
+          -		.inode = inode,
+          -		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
+          -		.cluster_size = F2FS_I(inode)->i_cluster_size,
+          -		.cluster_idx = NULL_CLUSTER,
+          -		.rpages = NULL,
+          -		.nr_rpages = 0,
+          -		.cpages = NULL,
+          -		.valid_nr_cpages = 0,
+          -		.rbuf = NULL,
+          -		.cbuf = NULL,
+          -		.rlen = PAGE_SIZE * F2FS_I(inode)->i_cluster_size,
+          -		.private = NULL,
+          -	};
+          +	struct compress_ctx *cc = NULL;
+           #endif
+           	int nr_folios, p, idx;
+           	int nr_pages;
+          @@ -2976,11 +2963,20 @@ f2fs_write_cache_pages(struct address_space *mapping,
+           	int i;
+           
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+          -	if (f2fs_compressed_file(inode) &&
+          -		1 << cc.log_cluster_size > F2FS_ONSTACK_PAGES) {
+          -		pages = f2fs_kzalloc(sbi, sizeof(struct page *) <<
+          -				cc.log_cluster_size, GFP_NOFS | __GFP_NOFAIL);
+          -		max_pages = 1 << cc.log_cluster_size;
+          +	if (f2fs_compressed_file(inode)) {
+          +		cc = f2fs_kzalloc(sbi, sizeof(*cc), GFP_NOFS | __GFP_NOFAIL);
+          +		cc->inode = inode;
+          +		cc->log_cluster_size = F2FS_I(inode)->i_log_cluster_size;
+          +		cc->cluster_size = F2FS_I(inode)->i_cluster_size;
+          +		cc->cluster_idx = NULL_CLUSTER;
+          +		cc->rlen = PAGE_SIZE * F2FS_I(inode)->i_cluster_size;
+          +
+          +		if (1 << cc->log_cluster_size > F2FS_ONSTACK_PAGES) {
+          +			pages = f2fs_kzalloc(sbi, sizeof(struct page *) <<
+          +					cc->log_cluster_size,
+          +					GFP_NOFS | __GFP_NOFAIL);
+          +			max_pages = 1 << cc->log_cluster_size;
+          +		}
+           	}
+           #endif
+           
+          @@ -3047,21 +3043,20 @@ write:
+           readd:
+           			need_readd = false;
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+          -			if (f2fs_compressed_file(inode)) {
+          +			if (cc) {
+           				void *fsdata = NULL;
+           				struct page *pagep;
+           				int ret2;
+           
+          -				ret = f2fs_init_compress_ctx(&cc);
+          +				ret = f2fs_init_compress_ctx(cc);
+           				if (ret) {
+           					done = 1;
+           					break;
+           				}
+           
+          -				if (!f2fs_cluster_can_merge_page(&cc,
+          -								folio->index)) {
+          -					ret = f2fs_write_multi_pages(&cc,
+          -						&submitted, wbc, io_type);
+          +				if (!f2fs_cluster_can_merge_page(cc, folio->index)) {
+          +					ret = f2fs_write_multi_pages(cc, &submitted,
+          +								     wbc, io_type);
+           					if (!ret)
+           						need_readd = true;
+           					goto result;
+          @@ -3070,11 +3065,11 @@ readd:
+           				if (unlikely(f2fs_cp_error(sbi)))
+           					goto lock_folio;
+           
+          -				if (!f2fs_cluster_is_empty(&cc))
+          +				if (!f2fs_cluster_is_empty(cc))
+           					goto lock_folio;
+           
+          -				if (f2fs_all_cluster_page_ready(&cc,
+          -					pages, i, nr_pages, true))
+          +				if (f2fs_all_cluster_page_ready(cc, pages, i,
+          +								nr_pages, true))
+           					goto lock_folio;
+           
+           				ret2 = f2fs_prepare_compress_overwrite(
+          @@ -3087,9 +3082,8 @@ readd:
+           				} else if (ret2 &&
+           					(!f2fs_compress_write_end(inode,
+           						fsdata, folio->index, 1) ||
+          -					 !f2fs_all_cluster_page_ready(&cc,
+          -						pages, i, nr_pages,
+          -						false))) {
+          +					 !f2fs_all_cluster_page_ready(cc, pages, i,
+          +								 nr_pages, false))) {
+           					retry = 1;
+           					break;
+           				}
+          @@ -3129,9 +3123,9 @@ continue_unlock:
+           				goto continue_unlock;
+           
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+          -			if (f2fs_compressed_file(inode)) {
+          +			if (cc) {
+           				folio_get(folio);
+          -				f2fs_compress_ctx_add_page(&cc, &folio->page);
+          +				f2fs_compress_ctx_add_page(cc, &folio->page);
+           				continue;
+           			}
+           #endif
+          @@ -3182,8 +3176,8 @@ next:
+           	}
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+           	/* flush remained pages in compress cluster */
+          -	if (f2fs_compressed_file(inode) && !f2fs_cluster_is_empty(&cc)) {
+          -		ret = f2fs_write_multi_pages(&cc, &submitted, wbc, io_type);
+          +	if (cc && !f2fs_cluster_is_empty(cc)) {
+          +		ret = f2fs_write_multi_pages(cc, &submitted, wbc, io_type);
+           		nwritten += submitted;
+           		wbc->nr_to_write -= submitted;
+           		if (ret) {
+          @@ -3191,8 +3185,8 @@ next:
+           			retry = 0;
+           		}
+           	}
+          -	if (f2fs_compressed_file(inode))
+          -		f2fs_destroy_compress_ctx(&cc, false);
+          +	if (cc)
+          +		f2fs_destroy_compress_ctx(cc, false);
+           #endif
+           	if (retry) {
+           		index = 0;
+          @@ -3212,6 +3206,7 @@ next:
+           		f2fs_submit_merged_ipu_write(sbi, &bio, NULL);
+           
+           #ifdef CONFIG_F2FS_FS_COMPRESSION
+          +	kfree(cc);
+           	if (pages != pages_local)
+           		kfree(pages);
+           #endif
+          PATCH
+
+          git apply --check "$RUNNER_TEMP/f2fs-compress-ctx-stack-v9.patch"
+          git apply "$RUNNER_TEMP/f2fs-compress-ctx-stack-v9.patch"
+          git diff --check
+
+          grep -Fq 'struct compress_ctx *cc = NULL;' fs/f2fs/data.c
+          grep -Fq 'cc = f2fs_kzalloc(sbi, sizeof(*cc), GFP_NOFS | __GFP_NOFAIL);' \
+            fs/f2fs/data.c
+          if grep -Fq 'struct compress_ctx cc = ' fs/f2fs/data.c; then
+            echo "F2FS compress_ctx is still stack allocated" >&2
+            exit 1
+          fi
+
+          "$KERNEL_DIR/scripts/checkpatch.pl" --no-tree --strict \
+            "$RUNNER_TEMP/f2fs-compress-ctx-stack-v9.patch" \
+            > "$LOG_DIR/f2fs-stack-checkpatch.log" 2>&1 || {
+              status=$?
+              cat "$LOG_DIR/f2fs-stack-checkpatch.log"
+              if grep -qE '^(ERROR|WARNING):' \
+                "$LOG_DIR/f2fs-stack-checkpatch.log"; then
+                exit "$status"
+              fi
+            }
+          cat "$LOG_DIR/f2fs-stack-checkpatch.log"
 
       - name: Integrate KernelSU Next and ensure x86_64 fix option exists
         shell: bash
