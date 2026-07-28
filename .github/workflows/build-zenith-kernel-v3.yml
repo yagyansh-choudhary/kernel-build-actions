@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next v3
+name: Build Zenith 6.9 Kernel with KernelSU Next v3 - Warning Clean V8 Fixed
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-27-v9-f2fs-lto-frame-fix"
+      WORKFLOW_REVISION: "2026-07-28-v8-fixed-f2fs-write-cache-pages"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
