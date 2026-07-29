@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V13
+name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V14
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-28-v13-arvox-aic8800d80-warning-clean"
+      WORKFLOW_REVISION: "2026-07-29-v14-arvox-aic8800d80-guard-normalization"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -309,33 +309,39 @@ jobs:
               "mark dormant patch info unused",
           )
 
-          # Normalize the allocation failure guard inside only the mesh-path
-          # update function. Some vendor snapshots omit braces and indent the
-          # following assignment as though it were guarded.
+          # Canonicalize every two-line allocation-failure guard in this
+          # vendor file. V13 only inspected one mesh function, while Clang's
+          # remaining diagnostic came from a different unbraced `if (!req)`
+          # followed by an over-indented req->vif_idx assignment. Adding braces
+          # is behavior-preserving and prevents the same warning in every such
+          # request-builder function.
           rel = "drivers/aic8800/aic8800_fdrv/rwnx_msg_tx.c"
           path, text = load(rel)
-          start = text.find("int rwnx_send_mesh_path_update_req(")
-          end = text.find("\nvoid rwnx_send_mesh_proxy_add_req", start)
-          if start < 0 or end < 0:
-              raise SystemExit(f"cannot locate mesh path update function in {rel}")
-          block = text[start:end]
-          if "if (!req) {" not in block:
-              block_new, count = re.subn(
-                  r"(?m)^([ \t]*)if \(!req\)[ \t]*\n[ \t]*return -ENOMEM;",
-                  lambda m: (
-                      f"{m.group(1)}if (!req) {{\n"
-                      f"{m.group(1)}    return -ENOMEM;\n"
-                      f"{m.group(1)}}}"
-                  ),
-                  block,
-                  count=1,
+          unbraced_req_guard = re.compile(
+              r"(?m)^([ \t]*)if \(!req\)[ \t]*\n"
+              r"[ \t]+return -ENOMEM;[ \t]*$"
+          )
+
+          def brace_req_guard(match: re.Match[str]) -> str:
+              indent = match.group(1)
+              return (
+                  f"{indent}if (!req) {{\n"
+                  f"{indent}    return -ENOMEM;\n"
+                  f"{indent}}}"
               )
-              if count != 1:
-                  raise SystemExit(
-                      f"cannot normalize allocation guard in {rel}"
-                  )
-              text = text[:start] + block_new + text[end:]
-              path.write_text(text)
+
+          text, guard_count = unbraced_req_guard.subn(brace_req_guard, text)
+          if guard_count < 1:
+              raise SystemExit(
+                  f"expected at least one unbraced allocation guard in {rel}"
+              )
+          path.write_text(text)
+
+          if unbraced_req_guard.search(path.read_text()):
+              raise SystemExit(
+                  f"unbraced if (!req) / return -ENOMEM guard remains in {rel}"
+              )
+          print(f"Normalized {guard_count} allocation guards in {rel}")
 
           # The allocator ignores its input pointer. Initialize it explicitly
           # so the call does not consume an indeterminate value.
@@ -2229,7 +2235,7 @@ jobs:
           KernelSU Next branch: $KSU_BRANCH
           KernelSU Next commit (pinned): $KSU_COMMIT
           AIC8800D80 repository: $AIC_REPO
-          AIC warning cleanup: CRC width, mesh guard, dormant patch state, TCP ACK pointer, RF-test fields, USB alignment fallback, and Kbuild jobserver
+          AIC warning cleanup: CRC width, all request-allocation guards, dormant patch state, TCP ACK pointer, RF-test fields, USB alignment fallback, and Kbuild jobserver
           AIC8800D80 branch: $AIC_BRANCH
           AIC8800D80 commit (pinned): $AIC_COMMIT
           Arvox AX900 modules: source-built aic_load_fw.ko and aic8800_fdrv.ko against the exact Zenith output tree
