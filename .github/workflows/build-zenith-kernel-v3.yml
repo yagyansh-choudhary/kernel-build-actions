@@ -1,4 +1,4 @@
-name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Warning Clean V14
+name: Build Zenith 6.9 Kernel with KernelSU Next + Arvox AX900 - Verified V15
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      WORKFLOW_REVISION: "2026-07-29-v14-arvox-aic8800d80-guard-normalization"
+      WORKFLOW_REVISION: "2026-07-29-v15-arvox-path-agnostic-packaging"
       KERNEL_REPO: https://github.com/android-generic/kernel-zenith.git
       KERNEL_BRANCH: "6.9"
       KERNEL_COMMIT: "12777f26667d321594dc60d2c1814d8ec9152dea"
@@ -141,6 +141,10 @@ jobs:
           grep -Eq '^CONFIG_RFKILL=(y|m)$' "$CONFIG_FILE"
           grep -qx 'CONFIG_BT=m' "$CONFIG_FILE"
           grep -qx 'CONFIG_BT_HCIBTUSB=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT_INTEL=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT_BCM=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT_RTL=m' "$CONFIG_FILE"
+          grep -qx 'CONFIG_BT_MTK=m' "$CONFIG_FILE"
           grep -qx 'CONFIG_USB=y' "$CONFIG_FILE"
           grep -qx 'CONFIG_FW_LOADER=y' "$CONFIG_FILE"
           grep -qx 'CONFIG_MODVERSIONS=y' "$CONFIG_FILE"
@@ -415,6 +419,234 @@ jobs:
             drivers/aic8800/aic8800_fdrv/rwnx_tx.c \
             drivers/aic8800/aic8800_fdrv/aic_priv_cmd.c \
             drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+
+      - name: Create and unit-test path-agnostic Arvox packager
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > "$GITHUB_WORKSPACE/arvox_packager.py" <<'PY'
+          #!/usr/bin/env python3
+          """Build a dependency-complete flat Arvox module bundle from modules.dep."""
+
+          from __future__ import annotations
+
+          import argparse
+          import shutil
+          import sys
+          from pathlib import Path
+
+
+          def module_name(path: str) -> str:
+              name = Path(path).name
+              for suffix in (".ko.zst", ".ko.xz", ".ko.gz", ".ko"):
+                  if name.endswith(suffix):
+                      return name[: -len(suffix)]
+              raise ValueError(f"Unsupported module filename: {path}")
+
+
+          def read_modules_dep(release_root: Path) -> dict[str, list[str]]:
+              depfile = release_root / "modules.dep"
+              if not depfile.is_file():
+                  raise FileNotFoundError(f"Missing depmod output: {depfile}")
+
+              graph: dict[str, list[str]] = {}
+              for line_number, raw in enumerate(depfile.read_text().splitlines(), 1):
+                  if not raw.strip():
+                      continue
+                  if ":" not in raw:
+                      raise ValueError(f"Malformed modules.dep line {line_number}: {raw}")
+                  module, dependencies = raw.split(":", 1)
+                  module = module.strip()
+                  if not module:
+                      raise ValueError(f"Empty module path on modules.dep line {line_number}")
+                  graph[module] = dependencies.split()
+              return graph
+
+
+          def resolve_roots(graph: dict[str, list[str]], roots: list[str]) -> list[str]:
+              names: dict[str, list[str]] = {}
+              for path in graph:
+                  names.setdefault(module_name(path), []).append(path)
+
+              resolved: list[str] = []
+              for requested in roots:
+                  candidates = names.get(requested, [])
+                  if len(candidates) != 1:
+                      details = "\n  ".join(candidates) if candidates else "<none>"
+                      raise RuntimeError(
+                          f"Expected exactly one installed module named {requested}; "
+                          f"found {len(candidates)}:\n  {details}"
+                      )
+                  resolved.append(candidates[0])
+              return resolved
+
+
+          def dependency_order(graph: dict[str, list[str]], roots: list[str]) -> list[str]:
+              ordered: list[str] = []
+              visited: set[str] = set()
+              active: set[str] = set()
+
+              def visit(module: str) -> None:
+                  if module in visited:
+                      return
+                  if module in active:
+                      raise RuntimeError(f"Dependency cycle detected at {module}")
+                  if module not in graph:
+                      raise RuntimeError(f"Dependency missing from modules.dep: {module}")
+
+                  active.add(module)
+                  for dependency in graph[module]:
+                      visit(dependency)
+                  active.remove(module)
+                  visited.add(module)
+                  ordered.append(module)
+
+              for root in roots:
+                  visit(root)
+              return ordered
+
+
+          def write_bundle(release_root: Path, bundle_dir: Path, ordered: list[str]) -> None:
+              modules_dir = bundle_dir / "modules"
+              firmware_dir = bundle_dir / "firmware"
+              android_dir = bundle_dir / "android"
+              modules_dir.mkdir(parents=True, exist_ok=True)
+              firmware_dir.mkdir(parents=True, exist_ok=True)
+              android_dir.mkdir(parents=True, exist_ok=True)
+
+              seen_basenames: dict[str, str] = {}
+              names: list[str] = []
+              for relative in ordered:
+                  source = release_root / relative
+                  if not source.is_file():
+                      raise FileNotFoundError(f"Installed module is missing: {source}")
+
+                  basename = source.name
+                  previous = seen_basenames.get(basename)
+                  if previous and previous != relative:
+                      raise RuntimeError(
+                          f"Flat bundle basename collision: {basename}: {previous} and {relative}"
+                      )
+                  seen_basenames[basename] = relative
+                  shutil.copy2(source, modules_dir / basename)
+                  names.append(module_name(relative))
+
+              (bundle_dir / "bundle-module-paths.txt").write_text(
+                  "".join(f"{relative}\n" for relative in ordered)
+              )
+              (bundle_dir / "modules.load.arvox-ax900").write_text(
+                  "".join(f"{name}\n" for name in names)
+              )
+
+              rc_lines = [
+                  "# Arvox AX900 / AIC8800D80 dependency-complete module order.",
+                  "# Adapt /vendor/lib/modules to your Android product layout.",
+                  "on property:sys.boot_completed=1",
+              ]
+              rc_lines.extend(
+                  f"    insmod /vendor/lib/modules/{Path(relative).name}"
+                  for relative in ordered
+              )
+              (android_dir / "init.arvox.rc").write_text("\n".join(rc_lines) + "\n")
+
+
+          def main() -> int:
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--release-root", required=True, type=Path)
+              parser.add_argument("--bundle-dir", required=True, type=Path)
+              parser.add_argument("--root", action="append", required=True)
+              args = parser.parse_args()
+
+              release_root = args.release_root.resolve()
+              bundle_dir = args.bundle_dir.resolve()
+              graph = read_modules_dep(release_root)
+              resolved_roots = resolve_roots(graph, args.root)
+              ordered = dependency_order(graph, resolved_roots)
+
+              if bundle_dir.exists():
+                  shutil.rmtree(bundle_dir)
+              write_bundle(release_root, bundle_dir, ordered)
+
+              print("Resolved dependency-complete Arvox bundle:")
+              for index, relative in enumerate(ordered, 1):
+                  print(f"{index:02d}. {module_name(relative):20s} {relative}")
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  raise SystemExit(main())
+              except Exception as exc:
+                  print(f"arvox_packager: error: {exc}", file=sys.stderr)
+                  raise SystemExit(1)
+          PY
+          chmod 0755 "$GITHUB_WORKSPACE/arvox_packager.py"
+          python3 -m py_compile "$GITHUB_WORKSPACE/arvox_packager.py"
+
+          # Unit-test the exact helper before the long kernel build. The fixture
+          # deliberately installs AIC modules in nested Kbuild directories—the
+          # layout that exposed V14's incorrect flat-path assumption.
+          TEST_ROOT="$(mktemp -d)"
+          trap 'rm -rf "$TEST_ROOT"' EXIT
+          RELEASE_ROOT="$TEST_ROOT/lib/modules/test-release"
+          BUNDLE_ROOT="$TEST_ROOT/bundle"
+          mkdir -p \
+            "$RELEASE_ROOT/kernel/net/wireless" \
+            "$RELEASE_ROOT/kernel/net/bluetooth" \
+            "$RELEASE_ROOT/kernel/drivers/bluetooth" \
+            "$RELEASE_ROOT/updates/arvox-ax900/aic_load_fw" \
+            "$RELEASE_ROOT/updates/arvox-ax900/aic8800_fdrv"
+
+          for relative in \
+            kernel/net/wireless/cfg80211.ko \
+            kernel/net/bluetooth/bluetooth.ko \
+            kernel/drivers/bluetooth/btintel.ko \
+            kernel/drivers/bluetooth/btbcm.ko \
+            kernel/drivers/bluetooth/btrtl.ko \
+            kernel/drivers/bluetooth/btmtk.ko \
+            kernel/drivers/bluetooth/btusb.ko \
+            updates/arvox-ax900/aic_load_fw/aic_load_fw.ko \
+            updates/arvox-ax900/aic8800_fdrv/aic8800_fdrv.ko; do
+            printf 'fixture\n' > "$RELEASE_ROOT/$relative"
+          done
+
+          cat > "$RELEASE_ROOT/modules.dep" <<'EOF'
+          kernel/net/wireless/cfg80211.ko:
+          kernel/net/bluetooth/bluetooth.ko:
+          kernel/drivers/bluetooth/btintel.ko: kernel/net/bluetooth/bluetooth.ko
+          kernel/drivers/bluetooth/btbcm.ko: kernel/net/bluetooth/bluetooth.ko
+          kernel/drivers/bluetooth/btrtl.ko: kernel/net/bluetooth/bluetooth.ko
+          kernel/drivers/bluetooth/btmtk.ko: kernel/net/bluetooth/bluetooth.ko
+          kernel/drivers/bluetooth/btusb.ko: kernel/net/bluetooth/bluetooth.ko kernel/drivers/bluetooth/btintel.ko kernel/drivers/bluetooth/btbcm.ko kernel/drivers/bluetooth/btrtl.ko kernel/drivers/bluetooth/btmtk.ko
+          updates/arvox-ax900/aic_load_fw/aic_load_fw.ko:
+          updates/arvox-ax900/aic8800_fdrv/aic8800_fdrv.ko: kernel/net/wireless/cfg80211.ko updates/arvox-ax900/aic_load_fw/aic_load_fw.ko
+          EOF
+
+          python3 "$GITHUB_WORKSPACE/arvox_packager.py" \
+            --release-root "$RELEASE_ROOT" \
+            --bundle-dir "$BUNDLE_ROOT" \
+            --root aic8800_fdrv \
+            --root btusb
+
+          cat > "$TEST_ROOT/expected.load" <<'EOF'
+          cfg80211
+          aic_load_fw
+          aic8800_fdrv
+          bluetooth
+          btintel
+          btbcm
+          btrtl
+          btmtk
+          btusb
+          EOF
+          diff -u "$TEST_ROOT/expected.load" "$BUNDLE_ROOT/modules.load.arvox-ax900"
+          test -s "$BUNDLE_ROOT/modules/aic_load_fw.ko"
+          test -s "$BUNDLE_ROOT/modules/aic8800_fdrv.ko"
+          test -s "$BUNDLE_ROOT/modules/btmtk.ko"
+          grep -Fq 'updates/arvox-ax900/aic_load_fw/aic_load_fw.ko' \
+            "$BUNDLE_ROOT/bundle-module-paths.txt"
+          echo "Arvox packaging helper unit test passed before the long build."
 
       - name: Apply audited KernelSU compatibility patch
         shell: bash
@@ -2058,76 +2290,133 @@ jobs:
       - name: Install and package kernel plus Arvox modules
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          mkdir -p "$LOG_DIR"
+          exec > >(tee "$LOG_DIR/arvox-package.log") 2>&1
+          set -x
           cd "$KERNEL_DIR"
 
-          make             O="$OUT_DIR"             ARCH=x86_64             LLVM=1             LLVM_IAS=1             INSTALL_MOD_PATH="$MODULES_DIR"             INSTALL_MOD_STRIP=1             modules_install             2>&1 | tee "$LOG_DIR/modules-install.log"
+          make \
+            --output-sync=target \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            INSTALL_MOD_PATH="$MODULES_DIR" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install \
+            2>&1 | tee "$LOG_DIR/modules-install.log"
 
           AIC_KBUILD_DIR="$AIC_DIR/drivers/aic8800"
-          make             O="$OUT_DIR"             ARCH=x86_64             LLVM=1             LLVM_IAS=1             M="$AIC_KBUILD_DIR"             INSTALL_MOD_PATH="$MODULES_DIR"             INSTALL_MOD_DIR="updates/arvox-ax900"             INSTALL_MOD_STRIP=1             modules_install             2>&1 | tee -a "$LOG_DIR/modules-install.log"
+          make \
+            --output-sync=target \
+            O="$OUT_DIR" \
+            ARCH=x86_64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            M="$AIC_KBUILD_DIR" \
+            INSTALL_MOD_PATH="$MODULES_DIR" \
+            INSTALL_MOD_DIR="updates/arvox-ax900" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install \
+            2>&1 | tee -a "$LOG_DIR/modules-install.log"
 
-          rm -f             "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/build"             "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/source"
+          RELEASE_ROOT="$MODULES_DIR/lib/modules/$KERNEL_RELEASE"
+          AIC_UPDATES_ROOT="$RELEASE_ROOT/updates/arvox-ax900"
+          test -d "$RELEASE_ROOT"
+          test -d "$AIC_UPDATES_ROOT"
 
-          # The supplied vendor prebuilts are intentionally not reused: their
-          # vermagic is 6.18.x and CONFIG_MODVERSIONS makes them ABI-incompatible
-          # with 6.9.9-zenith. Package source-built AIC modules and matching
-          # Zenith cfg80211/Bluetooth modules instead.
-          AIC_INSTALL_ROOT="$MODULES_DIR/lib/modules/$KERNEL_RELEASE/updates/arvox-ax900"
-          test -s "$AIC_INSTALL_ROOT/aic_load_fw.ko"
-          test -s "$AIC_INSTALL_ROOT/aic8800_fdrv.ko"
+          rm -f "$RELEASE_ROOT/build" "$RELEASE_ROOT/source"
+          # Some external Kbuild trees install a hashed modules.order helper as
+          # an ordinary file. It is not a kernel module and must not ship.
+          find "$AIC_UPDATES_ROOT" -type f -name 'modules.order*' -print -delete
+
+          mapfile -t AIC_LOAD_FW_INSTALLED < <(
+            find "$AIC_UPDATES_ROOT" -type f -name 'aic_load_fw.ko' -print
+          )
+          mapfile -t AIC_FDRV_INSTALLED < <(
+            find "$AIC_UPDATES_ROOT" -type f -name 'aic8800_fdrv.ko' -print
+          )
+          if [ "${#AIC_LOAD_FW_INSTALLED[@]}" -ne 1 ]; then
+            echo "Expected exactly one installed aic_load_fw.ko; found ${#AIC_LOAD_FW_INSTALLED[@]}" >&2
+            printf '%s\n' "${AIC_LOAD_FW_INSTALLED[@]}" >&2
+            exit 1
+          fi
+          if [ "${#AIC_FDRV_INSTALLED[@]}" -ne 1 ]; then
+            echo "Expected exactly one installed aic8800_fdrv.ko; found ${#AIC_FDRV_INSTALLED[@]}" >&2
+            printf '%s\n' "${AIC_FDRV_INSTALLED[@]}" >&2
+            exit 1
+          fi
+
+          AIC_LOAD_FW_INSTALLED="${AIC_LOAD_FW_INSTALLED[0]}"
+          AIC_FDRV_INSTALLED="${AIC_FDRV_INSTALLED[0]}"
+          for installed_module in "$AIC_LOAD_FW_INSTALLED" "$AIC_FDRV_INSTALLED"; do
+            test -s "$installed_module"
+            module_vermagic="$(modinfo -F vermagic "$installed_module")"
+            case "$module_vermagic" in
+              "$KERNEL_RELEASE "*) ;;
+              *)
+                echo "Installed module has mismatched vermagic: $installed_module: $module_vermagic" >&2
+                exit 1
+                ;;
+            esac
+          done
+          test "$(modinfo -F name "$AIC_LOAD_FW_INSTALLED")" = aic_load_fw
+          test "$(modinfo -F name "$AIC_FDRV_INSTALLED")" = aic8800_fdrv
 
           FIRMWARE_DST="$MODULES_DIR/lib/firmware/aic8800D80"
           mkdir -p "$FIRMWARE_DST"
           rsync -a --delete "$AIC_DIR/fw/aic8800D80/" "$FIRMWARE_DST/"
 
-          for firmware in             fmacfw_8800d80_u02.bin             fw_patch_8800d80_u02.bin             fw_patch_table_8800d80_u02.bin             fw_adid_8800d80_u02.bin; do
+          for firmware in \
+            fmacfw_8800d80_u02.bin \
+            fw_patch_8800d80_u02.bin \
+            fw_patch_table_8800d80_u02.bin \
+            fw_adid_8800d80_u02.bin; do
             test -s "$FIRMWARE_DST/$firmware"
           done
 
-          cat > "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.load.arvox-ax900" <<'EOF'
-          cfg80211
-          aic_load_fw
-          aic8800_fdrv
-          bluetooth
-          btintel
-          btbcm
-          btrtl
-          btusb
-          EOF
+          depmod -b "$MODULES_DIR" -F "$OUT_DIR/System.map" "$KERNEL_RELEASE" \
+            2>&1 | tee -a "$LOG_DIR/modules-install.log"
 
-          depmod -b "$MODULES_DIR" -F "$OUT_DIR/System.map" "$KERNEL_RELEASE"             2>&1 | tee -a "$LOG_DIR/modules-install.log"
+          test -s "$RELEASE_ROOT/modules.dep"
+          test -s "$RELEASE_ROOT/modules.alias"
+          grep -Fq 'aic_load_fw.ko' "$RELEASE_ROOT/modules.dep"
+          grep -Fq 'aic8800_fdrv.ko' "$RELEASE_ROOT/modules.dep"
+          grep -Eqi '^alias[[:space:]]+usb:vA69Cp8D80' "$RELEASE_ROOT/modules.alias"
 
-          grep -Fq 'aic_load_fw.ko' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.dep"
-          grep -Fq 'aic8800_fdrv.ko' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.dep"
-          grep -Eqi 'a69c.*8d80' "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.alias"
+          # Resolve and copy the actual transitive module dependency closure.
+          # This avoids all assumptions about nested INSTALL_MOD_DIR paths and
+          # automatically includes dependencies such as btmtk when selected.
+          python3 "$GITHUB_WORKSPACE/arvox_packager.py" \
+            --release-root "$RELEASE_ROOT" \
+            --bundle-dir "$ARVOX_BUNDLE_DIR" \
+            --root aic8800_fdrv \
+            --root btusb \
+            | tee "$LOG_DIR/arvox-dependency-closure.log"
 
-          # Make a focused Android/vendor integration bundle in addition to the
-          # complete module archive.
-          rm -rf "$ARVOX_BUNDLE_DIR"
-          mkdir -p             "$ARVOX_BUNDLE_DIR/modules"             "$ARVOX_BUNDLE_DIR/firmware/aic8800D80"             "$ARVOX_BUNDLE_DIR/android"
+          test -s "$ARVOX_BUNDLE_DIR/modules/aic_load_fw.ko"
+          test -s "$ARVOX_BUNDLE_DIR/modules/aic8800_fdrv.ko"
+          test -s "$ARVOX_BUNDLE_DIR/modules/cfg80211.ko"
+          test -s "$ARVOX_BUNDLE_DIR/modules/bluetooth.ko"
+          test -s "$ARVOX_BUNDLE_DIR/modules/btusb.ko"
+          test -s "$ARVOX_BUNDLE_DIR/modules/btmtk.ko"
 
-          for module_name in             cfg80211 mac80211 bluetooth btintel btbcm btrtl btusb             aic_load_fw aic8800_fdrv; do
-            module_path="$(find "$MODULES_DIR/lib/modules/$KERNEL_RELEASE"               -type f -name "${module_name}.ko" -print -quit)"
-            test -n "$module_path"
-            cp "$module_path" "$ARVOX_BUNDLE_DIR/modules/"
-          done
+          cp -a "$FIRMWARE_DST" "$ARVOX_BUNDLE_DIR/firmware/"
+          cp "$ARVOX_BUNDLE_DIR/modules.load.arvox-ax900" \
+            "$RELEASE_ROOT/modules.load.arvox-ax900"
 
-          cp -a "$FIRMWARE_DST/." "$ARVOX_BUNDLE_DIR/firmware/aic8800D80/"
-          cp "$MODULES_DIR/lib/modules/$KERNEL_RELEASE/modules.load.arvox-ax900"             "$ARVOX_BUNDLE_DIR/modules.load.arvox-ax900"
-
-          cat > "$ARVOX_BUNDLE_DIR/android/init.arvox.rc" <<'EOF'
-          # Arvox AX900 / AIC8800D80 module order for Android vendor integration.
-          # Adapt paths to the partition used by your product.
-          on property:sys.boot_completed=1
-              insmod /vendor/lib/modules/cfg80211.ko
-              insmod /vendor/lib/modules/aic_load_fw.ko
-              insmod /vendor/lib/modules/aic8800_fdrv.ko
-              insmod /vendor/lib/modules/bluetooth.ko
-              insmod /vendor/lib/modules/btintel.ko
-              insmod /vendor/lib/modules/btbcm.ko
-              insmod /vendor/lib/modules/btrtl.ko
-              insmod /vendor/lib/modules/btusb.ko
-          EOF
+          # Every copied module must match this exact kernel ABI.
+          while IFS= read -r -d '' bundled_module; do
+            bundled_vermagic="$(modinfo -F vermagic "$bundled_module")"
+            case "$bundled_vermagic" in
+              "$KERNEL_RELEASE "*) ;;
+              *)
+                echo "Bundle module has mismatched vermagic: $bundled_module: $bundled_vermagic" >&2
+                exit 1
+                ;;
+            esac
+          done < <(find "$ARVOX_BUNDLE_DIR/modules" -type f -name '*.ko' -print0)
 
           cat > "$ARVOX_BUNDLE_DIR/README.txt" <<EOF
           Arvox AX900 (AIC8800D80) support bundle
@@ -2136,18 +2425,32 @@ jobs:
           AIC source repository: $AIC_REPO
           AIC source commit: $AIC_COMMIT
 
-          Use these source-built modules only with this exact kernel release.
+          All modules in this bundle were resolved from the generated modules.dep
+          and built against this exact kernel release. The dependency/load order
+          is in modules.load.arvox-ax900 and android/init.arvox.rc.
+
           Do not copy the 6.18.x .ko files from arvox_vendor_setup.tar into this
           kernel: their vermagic and symbol CRCs do not match 6.9.9-zenith.
 
           Firmware destination on Linux: /lib/firmware/aic8800D80/
-          Recommended load order is in modules.load.arvox-ax900.
-          The normal Linux path is: modprobe aic8800_fdrv; dependencies are then
-          resolved by modules.dep. Bluetooth uses the kernel's standard btusb.
+          Normal Linux loading: modprobe aic8800_fdrv
+          Bluetooth loading: modprobe btusb
           EOF
 
-          tar --zstd -cf "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst" -C "$MODULES_DIR" .
-          tar --zstd -cf "$ARTIFACT_DIR/arvox-ax900-${KERNEL_RELEASE}.tar.zst" -C "$ARVOX_BUNDLE_DIR" .
+          tar --zstd -cf "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst" \
+            -C "$MODULES_DIR" .
+          tar --zstd -cf "$ARTIFACT_DIR/arvox-ax900-${KERNEL_RELEASE}.tar.zst" \
+            -C "$ARVOX_BUNDLE_DIR" .
+
+          test -s "$ARTIFACT_DIR/modules-${KERNEL_RELEASE}.tar.zst"
+          test -s "$ARTIFACT_DIR/arvox-ax900-${KERNEL_RELEASE}.tar.zst"
+          tar --zstd -tf "$ARTIFACT_DIR/arvox-ax900-${KERNEL_RELEASE}.tar.zst" \
+            | tee "$LOG_DIR/arvox-bundle-contents.log"
+          grep -Fq './modules/aic_load_fw.ko' "$LOG_DIR/arvox-bundle-contents.log"
+          grep -Fq './modules/aic8800_fdrv.ko' "$LOG_DIR/arvox-bundle-contents.log"
+          grep -Fq './firmware/aic8800D80/fmacfw_8800d80_u02.bin' \
+            "$LOG_DIR/arvox-bundle-contents.log"
+          echo "Arvox installation and packaging completed successfully."
 
       - name: Enforce zero-warning build gate
         shell: bash
@@ -2163,7 +2466,8 @@ jobs:
             warning-cleanup-preflight.log \
             kernel-build.log \
             arvox-module-build.log \
-            modules-install.log; do
+            modules-install.log \
+            arvox-package.log; do
             log_path="$LOG_DIR/$log_name"
             [ -f "$log_path" ] || continue
 
@@ -2223,9 +2527,19 @@ jobs:
             cp "$LOG_DIR/kernel-warnings.txt" "$ARTIFACT_DIR/kernel-warnings-${KERNEL_RELEASE}.txt"
           fi
           if [ -s "$LOG_DIR/arvox-module-build.log" ]; then
-            zstd -T0 -19 "$LOG_DIR/arvox-module-build.log"               -o "$ARTIFACT_DIR/arvox-module-build-${KERNEL_RELEASE}.log.zst"
+            zstd -T0 -19 "$LOG_DIR/arvox-module-build.log" \
+              -o "$ARTIFACT_DIR/arvox-module-build-${KERNEL_RELEASE}.log.zst"
           fi
-          zstd -T0 -19 "$LOG_DIR/modules-install.log" -o "$ARTIFACT_DIR/modules-install-${KERNEL_RELEASE}.log.zst"
+          if [ -s "$LOG_DIR/arvox-package.log" ]; then
+            zstd -T0 -19 "$LOG_DIR/arvox-package.log" \
+              -o "$ARTIFACT_DIR/arvox-package-${KERNEL_RELEASE}.log.zst"
+          fi
+          if [ -s "$LOG_DIR/arvox-dependency-closure.log" ]; then
+            cp "$LOG_DIR/arvox-dependency-closure.log" \
+              "$ARTIFACT_DIR/arvox-dependency-closure-${KERNEL_RELEASE}.txt"
+          fi
+          zstd -T0 -19 "$LOG_DIR/modules-install.log" \
+            -o "$ARTIFACT_DIR/modules-install-${KERNEL_RELEASE}.log.zst"
 
           cat > "$ARTIFACT_DIR/source-info.txt" <<EOF
           Kernel repository: $KERNEL_REPO
@@ -2238,7 +2552,7 @@ jobs:
           AIC warning cleanup: CRC width, all request-allocation guards, dormant patch state, TCP ACK pointer, RF-test fields, USB alignment fallback, and Kbuild jobserver
           AIC8800D80 branch: $AIC_BRANCH
           AIC8800D80 commit (pinned): $AIC_COMMIT
-          Arvox AX900 modules: source-built aic_load_fw.ko and aic8800_fdrv.ko against the exact Zenith output tree
+          Arvox AX900 modules: source-built AIC modules installed path-agnostically and bundled from the generated modules.dep dependency closure
           Arvox firmware: fw/aic8800D80 packaged under lib/firmware/aic8800D80
           Vendor prebuilt policy: rejected because supplied .ko vermagic is Linux 6.18.x, not 6.9.9-zenith
           KernelSU compatibility patch: three required Zenith 6.9 fixes plus APK certificate stack fix
